@@ -1,0 +1,1436 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+<meta name="robots" content="noindex, nofollow" />
+<title>Nightwatch — Feeding Tracker</title>
+<link rel="icon" href="data:," />
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  body { background: #14162B; }
+  .no-scrollbar::-webkit-scrollbar { display: none; }
+  .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+  input, select { color-scheme: dark; }
+</style>
+</head>
+<body class="text-[#EDEEF7]" style="font-family: 'Inter', system-ui, sans-serif;">
+<div id="root"></div>
+
+<script type="module">
+import React, { useState, useEffect, useRef, useCallback } from "https://esm.sh/react@18";
+import { createRoot } from "https://esm.sh/react-dom@18/client";
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+import { getAuth, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+
+const h = React.createElement;
+
+/* ---------- CONFIG ---------- */
+const FIREBASE_URL = "https://baby-16d15-default-rtdb.firebaseio.com";
+
+// Fill in FIREBASE_API_KEY (from Firebase Console → Project Settings → General →
+// "Web API Key") and enable Anonymous sign-in (Authentication → Sign-in method)
+// to lock the database down to signed-in requests only. Until you do, the app
+// keeps working exactly as it does now, unauthenticated.
+const FIREBASE_API_KEY = "AIzaSyBJ577YWRVRMJdP9U22G4oi_eh4ID-Jl-k";
+const FIREBASE_PROJECT_ID = "baby-16d15";
+
+const authEnabled = FIREBASE_API_KEY && !FIREBASE_API_KEY.startsWith("YOUR_");
+let firebaseAuth = null;
+if (authEnabled) {
+  const fbApp = initializeApp({
+    apiKey: FIREBASE_API_KEY,
+    authDomain: `${FIREBASE_PROJECT_ID}.firebaseapp.com`,
+    databaseURL: FIREBASE_URL,
+    projectId: FIREBASE_PROJECT_ID,
+  });
+  firebaseAuth = getAuth(fbApp);
+}
+
+let authReadyPromise = null;
+function waitForAuthReady() {
+  if (!authEnabled) return Promise.resolve();
+  if (!authReadyPromise) {
+    authReadyPromise = new Promise((resolve) => {
+      const unsub = onAuthStateChanged(firebaseAuth, () => {
+        unsub();
+        resolve();
+      });
+    });
+  }
+  return authReadyPromise;
+}
+
+async function authedUrl(path) {
+  if (!authEnabled) return `${FIREBASE_URL}${path}`;
+  await waitForAuthReady(); // restores a persisted session from local storage — needs no network
+  if (!firebaseAuth.currentUser) await signInAnonymously(firebaseAuth);
+  const token = await firebaseAuth.currentUser.getIdToken();
+  const sep = path.includes("?") ? "&" : "?";
+  return `${FIREBASE_URL}${path}${sep}auth=${token}`;
+}
+
+// Get a free key at aistudio.google.com/apikey (no credit card required) and
+// paste it below to enable the AI feeding-pattern insights panel. Until then,
+// that panel just shows a short setup note instead of failing.
+const GEMINI_API_KEY = "AQ.Ab8RN6IpMz1FhMPXCfhxK2ahd7vaQ51ogyg7OXLVQm-YhaWkiA";
+const GEMINI_MODEL = "gemini-flash-latest";
+
+// Permanent — baby's actual birth date, used to give the AI insight accurate age context.
+const BABY_BIRTH_DATE = "2026-05-13";
+
+function babyAgeSummary(nowDate) {
+  const days = Math.floor((keyToUTCms(dayKey(nowDate)) - keyToUTCms(BABY_BIRTH_DATE)) / 86400000);
+  if (days < 0) return "";
+  const weeks = Math.floor(days / 7);
+  const months = Math.floor(days / 30.44);
+  return `Baby was born ${BABY_BIRTH_DATE} and is currently ${days} days old (about ${weeks} weeks${months >= 1 ? `, roughly ${months} month${months === 1 ? "" : "s"}` : ""} old).`;
+}
+const insightsEnabled = GEMINI_API_KEY && !GEMINI_API_KEY.startsWith("YOUR_");
+
+function computeInsightSlot(nowDate) {
+  const p = tzParts(nowDate);
+  const today = dayKey(nowDate);
+  if (p.hour < 6) return `${shiftDayKey(today, -1)}-evening`;
+  if (p.hour < 18) return `${today}-morning`;
+  return `${today}-evening`;
+}
+
+async function generateInsightText(summary) {
+  const res = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        system_instruction: {
+          parts: [{
+            text: "You are a calm, knowledgeable infant-feeding pattern observer helping two tired parents. " +
+              "You'll be given the baby's age, and sometimes weight, plus recent feeding stats — use age (and weight, if given) " +
+              "only to judge whether the patterns look broadly typical for that age, never to diagnose or give medical advice. " +
+              "Only describe patterns in the numbers given, note anything that looks like a meaningful shift, and suggest " +
+              "checking with their pediatrician if something looks concerning. Keep it to 3-4 short sentences, warm and " +
+              "plain-spoken, no headers or bullet points.",
+          }],
+        },
+        contents: [{ role: "user", parts: [{ text: summary }] }],
+      }),
+    }
+  );
+  if (!res.ok) {
+    const errBody = await res.text().catch(() => "");
+    throw new Error(`Gemini request failed (${res.status}): ${errBody.slice(0, 200)}`);
+  }
+  const data = await res.json();
+  const text = data?.candidates?.[0]?.content?.parts?.map((p) => p.text).join("") || "";
+  if (!text) throw new Error("empty response");
+  return text.trim();
+}
+
+/* ---------- OFFLINE CACHE + PENDING WRITE QUEUE ---------- */
+const CACHE_KEY = "nightwatch_cache_v1";
+const QUEUE_KEY = "nightwatch_queue_v1";
+
+function loadCache() {
+  try {
+    return JSON.parse(localStorage.getItem(CACHE_KEY) || "[]");
+  } catch (e) {
+    return [];
+  }
+}
+function saveCache(entries) {
+  try {
+    localStorage.setItem(CACHE_KEY, JSON.stringify(entries));
+  } catch (e) {}
+}
+function loadQueue() {
+  try {
+    return JSON.parse(localStorage.getItem(QUEUE_KEY) || "[]");
+  } catch (e) {
+    return [];
+  }
+}
+function saveQueue(q) {
+  try {
+    localStorage.setItem(QUEUE_KEY, JSON.stringify(q));
+  } catch (e) {}
+}
+
+const BREAST_COLOR = "#F2C879";
+const FORMULA_COLOR = "#8FA8E0";
+const PATTERN_COLOR = "#B39DFF";
+const VOLUME_COLOR = "#7FD9A8";
+const ML_PER_OZ = 29.5735;
+
+// Pinned to a fixed timezone so both phones agree on "today", hour-of-day
+// buckets, and displayed times — regardless of each device's own clock
+// settings. Based on your current UTC+7 offset (Vietnam/Thailand/etc, no DST).
+// If this is wrong for where you actually are, tell me and I'll change it.
+const APP_TIMEZONE = "Asia/Bangkok";
+const APP_TZ_OFFSET_MINUTES = 420; // UTC+7, no DST — used to convert picked wall-clock time to a correct instant
+
+function tzWallTimeToISO(dateKey, hour, minute) {
+  const [y, m, d] = dateKey.split("-").map(Number);
+  const utcMs = Date.UTC(y, m - 1, d, hour, minute) - APP_TZ_OFFSET_MINUTES * 60000;
+  return new Date(utcMs).toISOString();
+}
+
+function tzParts(d) {
+  const dtf = new Intl.DateTimeFormat("en-US", {
+    timeZone: APP_TIMEZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+  const map = {};
+  dtf.formatToParts(new Date(d)).forEach((p) => { map[p.type] = p.value; });
+  let hour = parseInt(map.hour, 10);
+  if (hour === 24) hour = 0;
+  return {
+    year: parseInt(map.year, 10),
+    month: parseInt(map.month, 10),
+    day: parseInt(map.day, 10),
+    hour,
+    minute: parseInt(map.minute, 10),
+  };
+}
+function hourInTZ(d) {
+  return tzParts(d).hour;
+}
+
+/* ---------- HELPERS ---------- */
+function uid() {
+  return `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+}
+function isRecentEntry(entry, withinMs = 120000) {
+  const ts = parseInt(String(entry.id).split("-")[0], 10);
+  return !isNaN(ts) && Date.now() - ts < withinMs;
+}
+function mergeById(latest, local) {
+  const map = new Map();
+  latest.forEach((e) => map.set(e.id, e));
+  local.forEach((e) => {
+    if (!map.has(e.id) && isRecentEntry(e)) map.set(e.id, e);
+  });
+  return Array.from(map.values());
+}
+function dayKey(d) {
+  const p = tzParts(d);
+  return `${p.year}-${String(p.month).padStart(2, "0")}-${String(p.day).padStart(2, "0")}`;
+}
+function keyToUTCms(key) {
+  const [y, m, dd] = key.split("-").map(Number);
+  return Date.UTC(y, m - 1, dd);
+}
+function shiftDayKey(key, deltaDays) {
+  const dt = new Date(keyToUTCms(key) + deltaDays * 86400000);
+  return `${dt.getUTCFullYear()}-${String(dt.getUTCMonth() + 1).padStart(2, "0")}-${String(dt.getUTCDate()).padStart(2, "0")}`;
+}
+function fmtTime(d) {
+  return new Date(d).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false, timeZone: APP_TIMEZONE });
+}
+function fmtDayLabel(dOrKey) {
+  const key = typeof dOrKey === "string" ? dOrKey : dayKey(dOrKey);
+  const todayKey = dayKey(new Date());
+  if (key === todayKey) return "Today";
+  const diffDays = Math.round((keyToUTCms(todayKey) - keyToUTCms(key)) / 86400000);
+  if (diffDays === 1) return "Yesterday";
+  return new Date(keyToUTCms(key)).toLocaleDateString([], { weekday: "short", month: "numeric", day: "numeric", timeZone: "UTC" });
+}
+function fmtDuration(mins) {
+  if (mins == null) return null;
+  const m = Math.round(mins);
+  const hh = Math.floor(m / 60);
+  const rem = m % 60;
+  if (hh <= 0) return `${rem}m`;
+  if (rem === 0) return `${hh}h`;
+  return `${hh}h${String(rem).padStart(2, "0")}`;
+}
+/* ---------- SMALL UI PIECES ---------- */
+function TimeWheelColumn({ values, value, onChange, format }) {
+  const itemH = 30;
+  const visibleH = 90;
+  const pad = (visibleH - itemH) / 2;
+  const containerRef = useRef(null);
+  const scrollTimeout = useRef(null);
+  const didInit = useRef(false);
+
+  useEffect(() => {
+    const idx = values.indexOf(value);
+    if (containerRef.current && idx >= 0) {
+      containerRef.current.scrollTop = idx * itemH;
+      didInit.current = true;
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!didInit.current) return;
+    const idx = values.indexOf(value);
+    const el = containerRef.current;
+    if (el && idx >= 0 && Math.round(el.scrollTop / itemH) !== idx) {
+      el.scrollTop = idx * itemH;
+    }
+  }, [value]);
+
+  function settleToNearest() {
+    const el = containerRef.current;
+    if (!el) return;
+    const idx = Math.max(0, Math.min(values.length - 1, Math.round(el.scrollTop / itemH)));
+    if (values[idx] !== value) onChange(values[idx]);
+  }
+
+  function handleScroll() {
+    if (scrollTimeout.current) clearTimeout(scrollTimeout.current);
+    scrollTimeout.current = setTimeout(settleToNearest, 160);
+  }
+
+  function jumpTo(v) {
+    const idx = values.indexOf(v);
+    const el = containerRef.current;
+    if (el && idx >= 0) el.scrollTo({ top: idx * itemH, behavior: "smooth" });
+    onChange(v);
+  }
+
+  return h(
+    "div",
+    { className: "relative", style: { width: 56 } },
+    h("div", {
+      className: "pointer-events-none absolute left-0 right-0 top-1/2 -translate-y-1/2 z-10 border-y border-[#F2C879]/40 bg-[#F2C879]/5",
+      style: { height: itemH },
+    }),
+    h(
+      "div",
+      {
+        ref: containerRef,
+        onScroll: handleScroll,
+        className: "overflow-y-scroll no-scrollbar",
+        style: { height: visibleH, scrollSnapType: "y proximity" },
+      },
+      h("div", { style: { height: pad } }),
+      values.map((v) =>
+        h(
+          "div",
+          {
+            key: v,
+            onClick: () => jumpTo(v),
+            className: "flex items-center justify-center font-mono cursor-pointer",
+            style: {
+              height: itemH,
+              scrollSnapAlign: "center",
+              fontSize: v === value ? "17px" : "13px",
+              fontWeight: v === value ? 700 : 400,
+              color: v === value ? "#EDEEF7" : "#8286B8",
+            },
+          },
+          format ? format(v) : v
+        )
+      ),
+      h("div", { style: { height: pad } })
+    )
+  );
+}
+
+function VolumeWheel({ value, onChange }) {
+  const values = [];
+  for (let v = 30; v <= 160; v += 5) values.push(v);
+  const itemW = 26;
+  const visibleW = 280;
+  const pad = (visibleW - itemW) / 2;
+  const containerRef = useRef(null);
+  const scrollTimeout = useRef(null);
+  const didInit = useRef(false);
+
+  useEffect(() => {
+    if (didInit.current) return;
+    const idx = values.indexOf(value);
+    if (containerRef.current && idx >= 0) {
+      containerRef.current.scrollLeft = idx * itemW;
+      didInit.current = true;
+    }
+  }, []);
+
+  function settleToNearest() {
+    const el = containerRef.current;
+    if (!el) return;
+    const idx = Math.max(0, Math.min(values.length - 1, Math.round(el.scrollLeft / itemW)));
+    // Native CSS scroll-snap already settles the visual position — we just
+    // sync the value, rather than issuing a second competing scrollTo(),
+    // which is what was causing the jerky double-snap feel.
+    if (values[idx] !== value) onChange(values[idx]);
+  }
+
+  function handleScroll() {
+    if (scrollTimeout.current) clearTimeout(scrollTimeout.current);
+    scrollTimeout.current = setTimeout(settleToNearest, 160);
+  }
+
+  function jumpTo(v) {
+    const idx = values.indexOf(v);
+    const el = containerRef.current;
+    if (el && idx >= 0) el.scrollTo({ left: idx * itemW, behavior: "smooth" });
+    onChange(v);
+  }
+
+  return h(
+    "div",
+    { className: "select-none" },
+    h(
+      "div",
+      { className: "text-center mb-1.5" },
+      h("span", { className: "text-3xl", style: { fontFamily: "'Fraunces', Georgia, serif", fontWeight: 600 } }, value),
+      h("span", { className: "text-sm text-[#6C709E] font-mono ml-1" }, "ml")
+    ),
+    h(
+      "div",
+      { className: "relative mx-auto", style: { width: visibleW } },
+      h("div", {
+        className: "pointer-events-none absolute left-1/2 -translate-x-1/2 top-0 bottom-0 w-0.5 z-10 rounded",
+        style: { background: "#F2C879" },
+      }),
+      h(
+        "div",
+        {
+          ref: containerRef,
+          onScroll: handleScroll,
+          className: "overflow-x-scroll no-scrollbar flex",
+          style: { width: visibleW, scrollSnapType: "x proximity", scrollBehavior: "smooth" },
+        },
+        h("div", { style: { width: pad, flexShrink: 0 } }),
+        values.map((v) => {
+          const isMajor = (v - 30) % 20 === 0;
+          const isSelected = v === value;
+          return h(
+            "div",
+            {
+              key: v,
+              onClick: () => jumpTo(v),
+              className: "flex flex-col items-center justify-end cursor-pointer flex-shrink-0",
+              style: { width: itemW, height: 38, scrollSnapAlign: "center" },
+            },
+            h("div", {
+              style: {
+                width: isSelected ? 2.5 : 1.5,
+                height: isMajor ? 18 : 9,
+                background: isSelected ? "#F2C879" : "#4A4E85",
+                borderRadius: 2,
+              },
+            }),
+            h(
+              "span",
+              { className: "text-[8px] font-mono mt-1", style: { color: "#6C709E", visibility: isMajor ? "visible" : "hidden" } },
+              v
+            )
+          );
+        }),
+        h("div", { style: { width: pad, flexShrink: 0 } })
+      )
+    )
+  );
+}
+
+function IconBtn({ onClick, children, className, label }) {
+  return h(
+    "button",
+    { onClick, "aria-label": label, className: `bg-[#242759] border border-[#3D4080] hover:border-[#565AB0] text-[#C7CAE8] rounded-full transition-colors ${className || ""}` },
+    children
+  );
+}
+
+function SummaryCard({ label, value, unit, accent }) {
+  return h(
+    "div",
+    { className: "bg-[#1E2140] border border-[#282B52] rounded-2xl px-3 py-3 text-center" },
+    h("p", { className: "text-xs text-[#6C709E] font-mono uppercase tracking-wide mb-1" }, label),
+    h(
+      "p",
+      { className: "text-xl font-mono", style: { color: accent } },
+      value,
+      h("span", { className: "text-xs text-[#6C709E] ml-0.5" }, unit)
+    )
+  );
+}
+
+function TypeButton({ active, color, emoji, label, onClick }) {
+  return h(
+    "button",
+    {
+      onClick,
+      className: "flex-1 flex items-center justify-center gap-2 rounded-xl py-3 text-sm font-medium border-2 transition-all " + (active ? "" : "bg-[#242759] border-[#3D4080] text-[#C7CAE8]"),
+      style: active ? { background: color, borderColor: color, color: "#14162B" } : undefined,
+    },
+    h("span", null, emoji),
+    label
+  );
+}
+
+function StackedBarChart({ data, height, selectedIndex, onSelect }) {
+  const max = Math.max(1, ...data.map((d) => d.breast + d.formula));
+  const barAreaH = height - 40;
+  return h(
+    "div",
+    { className: "flex items-end justify-between", style: { height } },
+    data.map((d, i) => {
+      const total = d.breast + d.formula;
+      const isSelected = selectedIndex === i;
+      return h(
+        "div",
+        {
+          key: d.label,
+          onClick: () => onSelect(i),
+          className: "flex flex-col items-center flex-1 gap-1 cursor-pointer",
+        },
+        h("span", { className: "text-[9px] font-mono", style: { color: isSelected ? "#EDEEF7" : "#6C709E" } }, total || ""),
+        h(
+          "div",
+          {
+            className: "flex flex-col-reverse w-4 rounded-sm overflow-hidden",
+            style: {
+              height: barAreaH,
+              boxShadow: isSelected ? "0 0 0 2px #F2C879" : "none",
+            },
+          },
+          h("div", { style: { height: Math.max(0, (d.breast / max) * barAreaH), background: BREAST_COLOR, width: "100%" } }),
+          h("div", { style: { height: Math.max(0, (d.formula / max) * barAreaH), background: FORMULA_COLOR, width: "100%" } })
+        ),
+        h("span", { className: "text-[9px] font-mono", style: { color: isSelected ? "#EDEEF7" : "#6C709E" } }, d.label)
+      );
+    })
+  );
+}
+
+function FrequencyLineChart({ data, height, currentIndex }) {
+  const w = 280;
+  const marginX = 16;
+  const padTop = 18;
+  const padBottom = 14;
+  const plotH = height - padTop - padBottom;
+  const plotW = w - marginX * 2;
+  const max = Math.max(10, ...data.map((d) => d.pct));
+  const stepX = plotW / (data.length - 1);
+  const points = data.map((d, i) => ({
+    ...d,
+    x: marginX + i * stepX,
+    y: padTop + (1 - d.pct / max) * plotH,
+  }));
+  const pathD = points.map((p, i) => `${i === 0 ? "M" : "L"}${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(" ");
+  const nowX = points[currentIndex] ? points[currentIndex].x : null;
+  return h(
+    "div",
+    { className: "w-full" },
+    h(
+      "svg",
+      { viewBox: `0 0 ${w} ${height}`, width: "100%", height, preserveAspectRatio: "none", style: { overflow: "visible" } },
+      nowX != null && h("line", { x1: nowX, x2: nowX, y1: 2, y2: height - padBottom, stroke: "#F2C879", strokeWidth: 1, strokeDasharray: "3,3", opacity: 0.6 }),
+      nowX != null && h("text", { x: nowX, y: 9, fontSize: 7, fill: "#F2C879", textAnchor: "middle", fontFamily: "monospace", fontWeight: "bold" }, "now"),
+      h("path", { d: pathD, fill: "none", stroke: PATTERN_COLOR, strokeWidth: 2 }),
+      points.map((p, i) =>
+        h(
+          "g",
+          { key: p.label },
+          h("circle", { cx: p.x, cy: p.y, r: i === currentIndex ? 4 : 3, fill: i === currentIndex ? "#F2C879" : PATTERN_COLOR }),
+          h(
+            "text",
+            { x: p.x, y: Math.max(9, p.y - 8), fontSize: 8, fill: i === currentIndex ? "#F2C879" : "#8B8FB0", textAnchor: "middle", fontFamily: "monospace" },
+            `${p.pct}%`
+          )
+        )
+      )
+    ),
+    h(
+      "div",
+      { className: "flex justify-between mt-1 px-2" },
+      data.map((d, i) => h("span", { key: d.label, className: "text-[8px] font-mono", style: { color: i === currentIndex ? "#F2C879" : "#6C709E" } }, d.label))
+    )
+  );
+}
+
+function AvgVolumeChart({ data, height, currentIndex }) {
+  const max = Math.max(1, ...data.map((d) => d.avgMl));
+  const barAreaH = height - 30;
+  return h(
+    "div",
+    { className: "flex items-end justify-between gap-1.5 px-2", style: { height } },
+    data.map((d, i) => {
+      const isNow = i === currentIndex;
+      return h(
+        "div",
+        { key: d.label, className: "flex flex-col items-center flex-1 relative" },
+        isNow && h("div", { className: "absolute -top-1 text-[7px] font-bold", style: { color: "#F2C879" } }, "now"),
+        h("span", { className: "text-[9px] font-mono mb-1", style: { color: isNow ? "#F2C879" : "#6C709E" } }, d.count ? d.avgMl : "—"),
+        h("div", {
+          className: "w-full rounded-sm",
+          style: {
+            height: Math.max(1, (d.avgMl / max) * barAreaH),
+            background: VOLUME_COLOR,
+            opacity: d.count ? 1 : 0.15,
+            boxShadow: isNow ? "0 0 0 1.5px #F2C879" : "none",
+          },
+          title: `${d.label}: ${d.count ? `${d.avgMl} ml avg (${d.count} feed${d.count === 1 ? "" : "s"})` : "no data"}`,
+        }),
+        h("span", { className: "text-[8px] font-mono mt-1", style: { color: isNow ? "#F2C879" : "#6C709E" } }, d.label)
+      );
+    })
+  );
+}
+
+/* ---------- APP ---------- */
+function buildInsightSummary(entries, nowDate, weightKg) {
+  const sorted = [...entries].sort((a, b) => new Date(a.time) - new Date(b.time));
+  const now = nowDate;
+  const todayKeyNow = dayKey(now);
+  const last7Cutoff = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+  const last7 = sorted.filter((e) => new Date(e.time) >= last7Cutoff);
+
+  const todayEntries = sorted.filter((e) => dayKey(new Date(e.time)) === todayKeyNow);
+  const todayTotalMl = todayEntries.reduce((s, e) => s + e.volumeMl, 0);
+
+  const gaps = [];
+  for (let i = 1; i < last7.length; i++) gaps.push((new Date(last7[i].time) - new Date(last7[i - 1].time)) / 60000);
+  const avgIntervalMins = gaps.length ? Math.round(gaps.reduce((a, b) => a + b, 0) / gaps.length) : null;
+  const avgVolume = last7.length ? Math.round(last7.reduce((s, e) => s + e.volumeMl, 0) / last7.length) : null;
+
+  let dayMl = 0, nightMl = 0;
+  last7.forEach((e) => {
+    const hh = hourInTZ(e.time);
+    if (hh >= 6 && hh < 18) dayMl += e.volumeMl;
+    else nightMl += e.volumeMl;
+  });
+  const splitTotal = dayMl + nightMl;
+  const dayPct = splitTotal ? Math.round((dayMl / splitTotal) * 100) : null;
+
+  const lastEntry = sorted[sorted.length - 1];
+  const minsSinceLast = lastEntry ? Math.round((now - new Date(lastEntry.time)) / 60000) : null;
+
+  const last3DayTotals = [];
+  for (let i = 0; i < 3; i++) {
+    const key = shiftDayKey(todayKeyNow, -i);
+    const dayEntries = sorted.filter((e) => dayKey(new Date(e.time)) === key);
+    last3DayTotals.push(`${key}: ${dayEntries.reduce((s, e) => s + e.volumeMl, 0)}ml over ${dayEntries.length} feeds`);
+  }
+
+  return [
+    babyAgeSummary(now),
+    weightKg ? `Baby's current weight: ${weightKg} kg (this is a manually-logged value that stays current until the parents update it again — treat it as accurate for today's context, not a fresh daily measurement).` : "",
+    `Total feeds logged: ${sorted.length}.`,
+    avgIntervalMins != null ? `Average interval between feeds (last 7 days): ${avgIntervalMins} minutes.` : "Not enough feeds yet for an interval average.",
+    avgVolume != null ? `Average volume per feed (last 7 days): ${avgVolume} ml.` : "",
+    dayPct != null ? `Day (06:00-18:00) vs night (18:00-06:00) split (last 7 days): ${dayPct}% day, ${100 - dayPct}% night.` : "",
+    `Today's total so far: ${todayTotalMl} ml across ${todayEntries.length} feeds.`,
+    minsSinceLast != null ? `Minutes since the most recent feed: ${minsSinceLast}.` : "",
+    `Last 3 days: ${last3DayTotals.join("; ")}.`,
+  ].filter(Boolean).join(" ");
+}
+
+function App() {
+  const [entries, setEntries] = useState([]);
+  const [loaded, setLoaded] = useState(false);
+  const [syncing, setSyncing] = useState(false);
+  const [error, setError] = useState(null);
+
+  const [feedType, setFeedType] = useState("breast");
+  const [volumeMl, setVolumeMl] = useState(120);
+  const [useCustomTime, setUseCustomTime] = useState(false);
+  const [customDateKey, setCustomDateKey] = useState(dayKey(new Date()));
+  const [customHour, setCustomHour] = useState(tzParts(new Date()).hour);
+  const [customMinute, setCustomMinute] = useState(Math.floor(tzParts(new Date()).minute / 5) * 5);
+  const [submitting, setSubmitting] = useState(false);
+  const [now, setNow] = useState(new Date());
+  const [confirmingDeleteId, setConfirmingDeleteId] = useState(null);
+  const [selectedTrendDay, setSelectedTrendDay] = useState(6);
+  const [expandedDays, setExpandedDays] = useState({});
+  const [visibleDayCount, setVisibleDayCount] = useState(3);
+  const [isOnline, setIsOnline] = useState(typeof navigator !== "undefined" ? navigator.onLine : true);
+  const [pendingCount, setPendingCount] = useState(loadQueue().length);
+  const [insightText, setInsightText] = useState(null);
+  const [insightSlot, setInsightSlot] = useState(null);
+  const [insightLoading, setInsightLoading] = useState(false);
+  const [insightError, setInsightError] = useState(null);
+  const [weightKg, setWeightKg] = useState(null);
+  const [weightUpdatedAt, setWeightUpdatedAt] = useState(null);
+  const [editingWeight, setEditingWeight] = useState(false);
+  const [weightDraft, setWeightDraft] = useState("");
+
+  const pollRef = useRef(null);
+
+  const loadEntries = useCallback(async (showSpinner) => {
+    if (showSpinner) setSyncing(true);
+    try {
+      const res = await fetch(await authedUrl("/entries.json"));
+      const data = await res.json();
+      const fetched = data ? Object.entries(data).map(([id, val]) => ({ id, ...val })) : [];
+      setEntries((prev) => mergeById(fetched, prev));
+      saveCache(fetched);
+      setIsOnline(true);
+      setError(null);
+    } catch (e) {
+      // network failed — fall back to whatever we last cached, if we have nothing yet
+      setIsOnline(false);
+      setEntries((prev) => (prev.length ? prev : loadCache()));
+    } finally {
+      if (showSpinner) setSyncing(false);
+    }
+  }, []);
+
+  const flushQueue = useCallback(async () => {
+    let queue = loadQueue();
+    if (!queue.length) return;
+    while (queue.length) {
+      const op = queue[0];
+      try {
+        if (op.type === "put") {
+          const res = await fetch(await authedUrl(`/entries/${op.entry.id}.json`), {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ time: op.entry.time, type: op.entry.type, volumeMl: op.entry.volumeMl }),
+          });
+          if (!res.ok) throw new Error("put failed");
+        } else if (op.type === "delete") {
+          await fetch(await authedUrl(`/entries/${op.id}.json`), { method: "DELETE" });
+        } else if (op.type === "weight") {
+          const res = await fetch(await authedUrl("/babyProfile.json"), {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ weightKg: op.weightKg, updatedAt: op.updatedAt }),
+          });
+          if (!res.ok) throw new Error("weight sync failed");
+        }
+        queue = queue.slice(1);
+        saveQueue(queue);
+        setPendingCount(queue.length);
+        setIsOnline(true);
+      } catch (e) {
+        setIsOnline(false);
+        break; // stop here, retry everything remaining next time
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    (async () => {
+      await loadEntries(false);
+      await flushQueue();
+      setLoaded(true);
+    })();
+    pollRef.current = setInterval(() => {
+      loadEntries(false);
+      flushQueue();
+    }, 15000);
+    const onFocus = () => { loadEntries(false); flushQueue(); };
+    const onOnline = () => { setIsOnline(true); loadEntries(false); flushQueue(); };
+    const onOffline = () => setIsOnline(false);
+    window.addEventListener("focus", onFocus);
+    window.addEventListener("online", onOnline);
+    window.addEventListener("offline", onOffline);
+    return () => {
+      clearInterval(pollRef.current);
+      window.removeEventListener("focus", onFocus);
+      window.removeEventListener("online", onOnline);
+      window.removeEventListener("offline", onOffline);
+    };
+  }, [loadEntries, flushQueue]);
+
+  const entriesRef = useRef([]);
+  useEffect(() => { entriesRef.current = entries; }, [entries]);
+  const weightRef = useRef(null);
+  useEffect(() => { weightRef.current = weightKg; }, [weightKg]);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await fetch(await authedUrl("/babyProfile.json"));
+        const data = await res.json();
+        if (data && typeof data.weightKg === "number") {
+          setWeightKg(data.weightKg);
+          setWeightUpdatedAt(data.updatedAt || null);
+          try { localStorage.setItem("nightwatch_weight_cache", JSON.stringify(data)); } catch (e) {}
+        }
+      } catch (e) {
+        try {
+          const cached = JSON.parse(localStorage.getItem("nightwatch_weight_cache") || "null");
+          if (cached && typeof cached.weightKg === "number") {
+            setWeightKg(cached.weightKg);
+            setWeightUpdatedAt(cached.updatedAt || null);
+          }
+        } catch (e2) {}
+      }
+    })();
+  }, []);
+
+  async function saveWeight() {
+    const val = parseFloat(weightDraft);
+    if (!val || val <= 0) {
+      setEditingWeight(false);
+      return;
+    }
+    const rounded = Math.round(val * 100) / 100;
+    const updatedAt = new Date().toISOString();
+    setWeightKg(rounded);
+    setWeightUpdatedAt(updatedAt);
+    setEditingWeight(false);
+    try { localStorage.setItem("nightwatch_weight_cache", JSON.stringify({ weightKg: rounded, updatedAt })); } catch (e) {}
+    try {
+      const res = await fetch(await authedUrl("/babyProfile.json"), {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ weightKg: rounded, updatedAt }),
+      });
+      if (!res.ok) throw new Error("save failed");
+      setIsOnline(true);
+    } catch (e) {
+      const queue = loadQueue();
+      queue.push({ type: "weight", weightKg: rounded, updatedAt });
+      saveQueue(queue);
+      setPendingCount(queue.length);
+      setIsOnline(false);
+      setError("Weight saved on this phone — will sync once you're back online.");
+    }
+  }
+
+  const refreshInsight = useCallback(async (force = false) => {
+    if (!isOnline) return;
+    const currentEntries = entriesRef.current;
+    try {
+      const res = await fetch(await authedUrl("/insights/latest.json"));
+      const data = await res.json();
+      const currentSlot = computeInsightSlot(new Date());
+      if (data && data.text) {
+        setInsightText(data.text);
+        setInsightSlot(data.slotId || null);
+      }
+      const needsRegen = insightsEnabled && currentEntries.length >= 3 && (force || data?.slotId !== currentSlot);
+      if (needsRegen) {
+        setInsightLoading(true);
+        const summary = buildInsightSummary(currentEntries, new Date(), weightRef.current);
+        const text = await generateInsightText(summary);
+        const generatedAt = new Date().toISOString();
+        await fetch(await authedUrl("/insights/latest.json"), {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text, slotId: currentSlot, generatedAt }),
+        });
+        setInsightText(text);
+        setInsightSlot(currentSlot);
+        setInsightError(null);
+      }
+    } catch (e) {
+      setInsightError("Couldn't refresh the AI insight right now.");
+    } finally {
+      setInsightLoading(false);
+    }
+  }, [isOnline]);
+
+  useEffect(() => {
+    if (!loaded) return;
+    refreshInsight();
+    const t = setInterval(() => refreshInsight(), 5 * 60 * 1000);
+    return () => clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loaded]);
+
+  useEffect(() => {
+    const t = setInterval(() => setNow(new Date()), 30000);
+    return () => clearInterval(t);
+  }, []);
+
+  async function handleAddEntry() {
+    const vol = volumeMl;
+    if (!vol || vol <= 0) {
+      setError("Enter a volume greater than zero.");
+      return;
+    }
+    setSubmitting(true);
+    setError(null);
+    const time = useCustomTime ? tzWallTimeToISO(customDateKey, customHour, customMinute) : new Date().toISOString();
+    const entry = { id: uid(), time, type: feedType, volumeMl: Math.round(vol) };
+    const next = [...entries, entry].sort((a, b) => new Date(a.time) - new Date(b.time));
+    setEntries(next);
+    setUseCustomTime(false);
+    const nowParts = tzParts(new Date());
+    setCustomDateKey(dayKey(new Date()));
+    setCustomHour(nowParts.hour);
+    setCustomMinute(Math.floor(nowParts.minute / 5) * 5);
+    try {
+      const res = await fetch(await authedUrl(`/entries/${entry.id}.json`), {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ time: entry.time, type: entry.type, volumeMl: entry.volumeMl }),
+      });
+      if (!res.ok) throw new Error("save failed");
+      setIsOnline(true);
+    } catch (e) {
+      const queue = loadQueue();
+      queue.push({ type: "put", entry: { id: entry.id, time: entry.time, type: entry.type, volumeMl: entry.volumeMl } });
+      saveQueue(queue);
+      setPendingCount(queue.length);
+      setIsOnline(false);
+      setError("Saved on this phone — will sync once you're back online.");
+    }
+    setSubmitting(false);
+  }
+
+  async function handleDelete(id) {
+    const next = entries.filter((e) => e.id !== id);
+    setEntries(next);
+    setConfirmingDeleteId(null);
+    try {
+      const res = await fetch(await authedUrl(`/entries/${id}.json`), { method: "DELETE" });
+      if (!res.ok) throw new Error("delete failed");
+      setIsOnline(true);
+    } catch (e) {
+      const queue = loadQueue();
+      queue.push({ type: "delete", id });
+      saveQueue(queue);
+      setPendingCount(queue.length);
+      setIsOnline(false);
+      setError("Delete saved on this phone — will sync once you're back online.");
+    }
+  }
+
+  const sorted = [...entries].sort((a, b) => new Date(a.time) - new Date(b.time));
+  const todayKeyNow = dayKey(now);
+  const todayEntries = sorted.filter((e) => dayKey(new Date(e.time)) === todayKeyNow);
+  const lastEntry = sorted[sorted.length - 1];
+  const minutesSinceLast = lastEntry ? (now - new Date(lastEntry.time)) / 60000 : null;
+  let feedColor = "#EDEEF7";
+  let showFeedWarning = false;
+  if (minutesSinceLast != null && minutesSinceLast >= 150) {
+    showFeedWarning = true;
+    feedColor = minutesSinceLast >= 180 ? "#E86A5C" : "#F2A65A";
+  }
+
+  const todayTotalMl = todayEntries.reduce((s, e) => s + e.volumeMl, 0);
+  const todayBreastMl = todayEntries.filter((e) => e.type === "breast").reduce((s, e) => s + e.volumeMl, 0);
+  const todayFormulaMl = todayEntries.filter((e) => e.type === "formula").reduce((s, e) => s + e.volumeMl, 0);
+
+  const trendDayKeys = [];
+  for (let i = 6; i >= 0; i--) trendDayKeys.push(shiftDayKey(todayKeyNow, -i));
+  const trendData = trendDayKeys.map((key) => {
+    const dayEntries = sorted.filter((e) => dayKey(new Date(e.time)) === key);
+    return {
+      label: new Date(keyToUTCms(key)).toLocaleDateString([], { weekday: "short", timeZone: "UTC" }),
+      fullLabel: fmtDayLabel(key),
+      breast: dayEntries.filter((e) => e.type === "breast").reduce((s, e) => s + e.volumeMl, 0),
+      formula: dayEntries.filter((e) => e.type === "formula").reduce((s, e) => s + e.volumeMl, 0),
+    };
+  });
+
+  const last7Cutoff = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+  const last14Cutoff = new Date(now.getTime() - 14 * 24 * 60 * 60 * 1000);
+  const last7Entries = sorted.filter((e) => new Date(e.time) >= last7Cutoff);
+  const last14Entries = sorted.filter((e) => new Date(e.time) >= last14Cutoff);
+
+  const avgVolume7 = last7Entries.length ? Math.round(last7Entries.reduce((s, e) => s + e.volumeMl, 0) / last7Entries.length) : null;
+  const intervalGaps7 = [];
+  for (let i = 1; i < last7Entries.length; i++) {
+    intervalGaps7.push((new Date(last7Entries[i].time) - new Date(last7Entries[i - 1].time)) / 60000);
+  }
+  const avgIntervalMins7 = intervalGaps7.length ? intervalGaps7.reduce((a, b) => a + b, 0) / intervalGaps7.length : null;
+
+  let dayMl = 0, nightMl = 0;
+  last7Entries.forEach((e) => {
+    const hh = hourInTZ(e.time);
+    if (hh >= 6 && hh < 18) dayMl += e.volumeMl;
+    else nightMl += e.volumeMl;
+  });
+  const splitTotalMl = dayMl + nightMl;
+  const dayPct = splitTotalMl ? Math.round((dayMl / splitTotalMl) * 100) : 0;
+  const nightPct = splitTotalMl ? 100 - dayPct : 0;
+
+  const volumeBuckets = Array.from({ length: 8 }, (_, i) => ({ hourStart: i * 3, totalMl: 0, count: 0 }));
+  last14Entries.forEach((e) => {
+    const hh = hourInTZ(e.time);
+    const idx = Math.floor(hh / 3);
+    volumeBuckets[idx].totalMl += e.volumeMl;
+    volumeBuckets[idx].count += 1;
+  });
+  const totalLast14 = last14Entries.length;
+  const avgVolumeByTimeData = volumeBuckets.map((b) => ({
+    label: `${b.hourStart}-${b.hourStart + 3}`,
+    avgMl: b.count ? Math.round(b.totalMl / b.count) : 0,
+    count: b.count,
+    pct: totalLast14 ? Math.round((b.count / totalLast14) * 100) : 0,
+  }));
+  const currentBucketIndex = Math.floor(hourInTZ(now) / 3);
+
+  const historyByDay = {};
+  sorted.forEach((e, idx) => {
+    const key = dayKey(new Date(e.time));
+    if (!historyByDay[key]) historyByDay[key] = [];
+    const prev = sorted[idx - 1];
+    const gapMins = prev ? (new Date(e.time) - new Date(prev.time)) / 60000 : null;
+    historyByDay[key].push({ ...e, gapMins });
+  });
+  const historyKeys = Object.keys(historyByDay).sort((a, b) => (a < b ? 1 : -1));
+
+  function handleExport() {
+    const data = JSON.stringify(sorted, null, 2);
+    const blob = new Blob([data], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `nightwatch-backup-${dayKey(new Date())}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
+  if (!loaded) {
+    return h("div", { className: "min-h-screen bg-[#14162B] flex items-center justify-center" },
+      h("div", { className: "text-[#8B8FB0] font-mono text-sm tracking-wide" }, "loading nightwatch…"));
+  }
+
+  return h(
+    "div",
+    { className: "min-h-screen bg-[#14162B] text-[#EDEEF7]" },
+    h(
+      "div",
+      { className: "max-w-md mx-auto px-4 pb-16" },
+
+      /* Header */
+      h(
+        "div",
+        { className: "pt-8 pb-4 flex items-start justify-between" },
+        h(
+          "div",
+          null,
+          h("h1", { className: "text-3xl leading-none", style: { fontFamily: "'Fraunces', Georgia, serif", fontWeight: 600 } }, "Nightwatch"),
+          h("p", { className: "text-[#8B8FB0] text-sm mt-1 font-mono" }, now.toLocaleDateString([], { weekday: "long", month: "long", day: "numeric", timeZone: APP_TIMEZONE })),
+          (!isOnline || pendingCount > 0) &&
+            h(
+              "p",
+              { className: "text-[11px] font-mono mt-1 flex items-center gap-1.5", style: { color: "#F2A65A" } },
+              h("span", { className: "w-1.5 h-1.5 rounded-full inline-block", style: { background: "#F2A65A" } }),
+              !isOnline ? "Offline" : "Syncing…",
+              pendingCount > 0 && ` · ${pendingCount} pending`
+            )
+        ),
+        h(
+          "div",
+          { className: "flex gap-2" },
+          h(IconBtn, { onClick: handleExport, className: "mt-1 p-2.5", label: "Export backup" }, "⬇"),
+          h(IconBtn, { onClick: () => loadEntries(true), className: "mt-1 p-2.5", label: "Sync now" },
+            h("span", { className: syncing ? "inline-block animate-spin" : "inline-block" }, "⟳"))
+        )
+      ),
+
+      /* Since last feed */
+      h(
+        "div",
+        { className: "bg-[#1E2140] border border-[#282B52] rounded-2xl px-5 py-5 mb-6" },
+        h("p", { className: "text-xs text-[#6C709E] font-mono uppercase tracking-wide mb-2" }, "Since last feed"),
+        h(
+          "div",
+          { className: "flex items-baseline gap-2 flex-wrap" },
+          h("span", { className: "text-4xl", style: { fontFamily: "'Fraunces', Georgia, serif", fontWeight: 600, color: feedColor } }, minutesSinceLast != null ? fmtDuration(minutesSinceLast) : "—"),
+          showFeedWarning &&
+            h(
+              "span",
+              { className: "text-[10px] font-semibold px-2 py-1 rounded-full", style: { background: `${feedColor}22`, color: feedColor } },
+              "Feed now"
+            )
+        ),
+        lastEntry
+          ? h(
+              "div",
+              { className: "flex items-center gap-1.5 mt-2 text-sm text-[#8B8FB0]" },
+              h("span", { className: "inline-block w-2 h-2 rounded-full flex-shrink-0", style: { background: lastEntry.type === "breast" ? BREAST_COLOR : FORMULA_COLOR } }),
+              h("span", { className: "font-mono" }, fmtTime(lastEntry.time)),
+              h("span", null, "·"),
+              h("span", null, lastEntry.type === "breast" ? "Breast milk" : "Formula"),
+              h("span", null, "·"),
+              h("span", { className: "font-mono" }, `${lastEntry.volumeMl} ml`)
+            )
+          : h("p", { className: "text-sm text-[#8B8FB0] mt-2" }, "No feeds logged yet")
+      ),
+
+      /* AI Feeding Insight */
+      h(
+        "div",
+        { className: "bg-[#1E2140] border border-[#282B52] rounded-2xl px-4 py-2.5 mb-6" },
+        h(
+          "div",
+          { className: "flex items-center justify-between mb-1" },
+          h("p", { className: "text-[10px] text-[#6C709E] font-mono uppercase tracking-wide" }, "AI feeding insight"),
+          h(
+            "div",
+            { className: "flex items-center gap-2" },
+            editingWeight
+              ? h(
+                  "div",
+                  { className: "flex items-center gap-1" },
+                  h("input", {
+                    autoFocus: true,
+                    value: weightDraft,
+                    onChange: (e) => setWeightDraft(e.target.value),
+                    onKeyDown: (e) => e.key === "Enter" && saveWeight(),
+                    type: "number",
+                    inputMode: "decimal",
+                    placeholder: "kg",
+                    className: "w-12 bg-[#242759] border border-[#3D4080] rounded-full px-2 py-0.5 text-[11px] outline-none focus:border-[#8FA8E0] font-mono",
+                  }),
+                  h("button", { onClick: saveWeight, className: "text-[#F2C879] text-[11px] font-bold px-1", "aria-label": "Save weight" }, "✓")
+                )
+              : h(
+                  "button",
+                  {
+                    onClick: () => { setWeightDraft(weightKg != null ? String(weightKg) : ""); setEditingWeight(true); },
+                    className: "text-[10px] font-mono text-[#6C709E] hover:text-[#C7CAE8]",
+                    title: weightUpdatedAt ? `Last updated ${fmtTime(weightUpdatedAt)} on ${dayKey(new Date(weightUpdatedAt))} — stays until you change it` : undefined,
+                  },
+                  weightKg != null ? `⚖ ${weightKg} kg ✎` : "⚖ add weight"
+                ),
+            insightsEnabled &&
+              h(
+                "button",
+                { onClick: () => refreshInsight(true), className: "text-[#6C709E] hover:text-[#EDEEF7]", "aria-label": "Refresh insight now" },
+                h("span", { className: insightLoading ? "inline-block animate-spin" : "inline-block" }, "⟳")
+              )
+          )
+        ),
+        h(
+          "div",
+          { className: "overflow-y-auto pr-1", style: { maxHeight: 56 } },
+          !insightsEnabled
+            ? h(
+                "p",
+                { className: "text-xs text-[#8B8FB0] leading-relaxed" },
+                "Get a free key at aistudio.google.com/apikey (no credit card needed), then paste it into GEMINI_API_KEY in the code to turn this on."
+              )
+            : insightLoading && !insightText
+            ? h("p", { className: "text-xs text-[#8B8FB0]" }, "Thinking about the patterns…")
+            : insightText
+            ? h("p", { className: "text-xs text-[#C7CAE8] leading-relaxed" }, insightText)
+            : h("p", { className: "text-xs text-[#8B8FB0]" }, "Log a few more feeds and an insight will appear here.")
+        ),
+        !insightText && insightError && h("p", { className: "text-[10px] text-[#E86A5C] mt-1" }, insightError)
+      ),
+
+      /* Today summary */
+      h(
+        "div",
+        { className: "grid grid-cols-3 gap-2 mb-6" },
+        h(SummaryCard, { label: "Today", value: `${todayTotalMl}`, unit: "ml", accent: "#EDEEF7" }),
+        h(SummaryCard, { label: "Breast", value: `${todayBreastMl}`, unit: "ml", accent: BREAST_COLOR }),
+        h(SummaryCard, { label: "Formula", value: `${todayFormulaMl}`, unit: "ml", accent: FORMULA_COLOR })
+      ),
+
+      /* Log form */
+      h(
+        "div",
+        { className: "bg-[#1E2140] border border-[#282B52] rounded-2xl p-4 mb-6" },
+        h(
+          "div",
+          { className: "flex gap-2 mb-4" },
+          h(TypeButton, { active: feedType === "breast", color: BREAST_COLOR, emoji: "💧", label: "Breast milk", onClick: () => setFeedType("breast") }),
+          h(TypeButton, { active: feedType === "formula", color: FORMULA_COLOR, emoji: "🍼", label: "Formula", onClick: () => setFeedType("formula") })
+        ),
+
+        h("p", { className: "text-xs text-[#6C709E] mb-2 font-mono uppercase tracking-wide text-center" }, "Volume"),
+        h(VolumeWheel, { value: volumeMl, onChange: setVolumeMl }),
+        h("p", { className: "text-xs text-[#6C709E] mt-1.5 mb-3 font-mono text-center" }, `≈ ${(volumeMl / ML_PER_OZ).toFixed(1)} oz`),
+
+        h("p", { className: "text-xs text-[#6C709E] mb-2 font-mono uppercase tracking-wide" }, "When"),
+        h(
+          "div",
+          { className: "flex gap-2 mb-3" },
+          h(
+            "button",
+            {
+              onClick: () => setUseCustomTime(false),
+              className: "flex-1 py-2 rounded-xl text-sm border transition-colors " +
+                (!useCustomTime ? "bg-[#EDEEF7] text-[#14162B] border-[#EDEEF7]" : "bg-[#242759] border-[#3D4080] text-[#C7CAE8] hover:border-[#565AB0]"),
+            },
+            "Log now"
+          ),
+          h(
+            "button",
+            {
+              onClick: () => {
+                const p = tzParts(new Date());
+                setCustomDateKey(dayKey(new Date()));
+                setCustomHour(p.hour);
+                setCustomMinute(Math.floor(p.minute / 5) * 5);
+                setUseCustomTime(true);
+              },
+              className: "flex-1 py-2 rounded-xl text-sm border transition-colors " +
+                (useCustomTime ? "bg-[#EDEEF7] text-[#14162B] border-[#EDEEF7]" : "bg-[#242759] border-[#3D4080] text-[#C7CAE8] hover:border-[#565AB0]"),
+            },
+            "Add past feeding"
+          )
+        ),
+        useCustomTime && h(
+          "div",
+          { className: "mb-3" },
+          h(
+            "div",
+            { className: "flex gap-2 mb-2" },
+            [0, -1].map((delta) => {
+              const key = shiftDayKey(dayKey(new Date()), delta);
+              const label = delta === 0 ? "Today" : "Yesterday";
+              const isSel = customDateKey === key;
+              return h(
+                "button",
+                {
+                  key: label,
+                  onClick: () => setCustomDateKey(key),
+                  className: "flex-1 py-1.5 rounded-lg text-xs border transition-colors " +
+                    (isSel ? "bg-[#EDEEF7] text-[#14162B] border-[#EDEEF7]" : "bg-[#242759] border-[#3D4080] text-[#C7CAE8]"),
+                },
+                label
+              );
+            }),
+            h("input", {
+              type: "date",
+              value: customDateKey,
+              max: dayKey(new Date()),
+              onChange: (e) => setCustomDateKey(e.target.value),
+              className: "flex-1 bg-[#242759] border border-[#3D4080] rounded-lg px-2 text-xs text-[#EDEEF7] outline-none focus:border-[#8FA8E0] font-mono",
+            })
+          ),
+          h(
+            "div",
+            { className: "flex items-center justify-center gap-1 bg-[#242759] border border-[#3D4080] rounded-lg py-1" },
+            h(TimeWheelColumn, {
+              values: Array.from({ length: 24 }, (_, hh) => hh),
+              value: customHour,
+              onChange: setCustomHour,
+              format: (v) => String(v).padStart(2, "0"),
+            }),
+            h("span", { className: "font-mono text-lg text-[#6C709E]" }, ":"),
+            h(TimeWheelColumn, {
+              values: Array.from({ length: 12 }, (_, i) => i * 5),
+              value: customMinute,
+              onChange: setCustomMinute,
+              format: (v) => String(v).padStart(2, "0"),
+            }),
+            h("span", { className: "text-[10px] text-[#6C709E] font-mono ml-1" }, "24h")
+          )
+        ),
+
+        error && h("p", { className: "text-xs text-[#E08A8A] mb-3" }, error),
+
+        h(
+          "button",
+          {
+            onClick: handleAddEntry,
+            disabled: submitting,
+            className: "w-full bg-[#F2C879] text-[#14162B] rounded-xl py-3.5 font-semibold text-base shadow-lg border border-[#F2C879] active:scale-[0.98] transition-transform disabled:opacity-50",
+          },
+          submitting ? "Logging…" : useCustomTime ? "Add past feeding" : "Log feed"
+        )
+      ),
+
+      /* Trend chart */
+      h(
+        "div",
+        { className: "mb-6" },
+        h("h2", { className: "text-sm font-mono uppercase tracking-wide text-[#6C709E] mb-3" }, "Last 7 days"),
+        h(
+          "div",
+          { className: "bg-[#1E2140] border border-[#282B52] rounded-2xl p-3" },
+          h(StackedBarChart, { data: trendData, height: 170, selectedIndex: selectedTrendDay, onSelect: setSelectedTrendDay }),
+          h(
+            "div",
+            { className: "flex gap-4 justify-center mt-2 text-xs text-[#8B8FB0]" },
+            h("span", { className: "flex items-center gap-1.5" }, h("span", { className: "w-2.5 h-2.5 rounded-full inline-block", style: { background: BREAST_COLOR } }), "Breast milk"),
+            h("span", { className: "flex items-center gap-1.5" }, h("span", { className: "w-2.5 h-2.5 rounded-full inline-block", style: { background: FORMULA_COLOR } }), "Formula")
+          ),
+          selectedTrendDay != null &&
+            trendData[selectedTrendDay] &&
+            h(
+              "div",
+              { className: "mt-3 bg-[#14162B] border border-[#282B52] rounded-xl px-3 py-2.5 flex items-center justify-between" },
+              h("span", { className: "text-sm text-[#C7CAE8] font-medium" }, trendData[selectedTrendDay].fullLabel),
+              h(
+                "div",
+                { className: "flex gap-3 text-xs font-mono" },
+                h("span", { style: { color: BREAST_COLOR } }, `${trendData[selectedTrendDay].breast} ml`),
+                h("span", { style: { color: FORMULA_COLOR } }, `${trendData[selectedTrendDay].formula} ml`),
+                h("span", { className: "text-[#6C709E]" }, `= ${trendData[selectedTrendDay].breast + trendData[selectedTrendDay].formula} ml`)
+              )
+            )
+        )
+      ),
+
+      /* Feeding patterns */
+      h(
+        "div",
+        { className: "mb-6" },
+        h("h2", { className: "text-sm font-mono uppercase tracking-wide text-[#6C709E] mb-3" }, "Feeding patterns"),
+
+        h(
+          "div",
+          { className: "grid grid-cols-2 gap-2 mb-3" },
+          h(
+            "div",
+            { className: "bg-[#1E2140] border border-[#282B52] rounded-2xl px-3 py-3 text-center" },
+            h("p", { className: "text-xs text-[#6C709E] font-mono uppercase tracking-wide mb-1" }, "Avg interval"),
+            h("p", { className: "text-xl font-mono", style: { color: PATTERN_COLOR } }, avgIntervalMins7 != null ? fmtDuration(avgIntervalMins7) : "—"),
+            h("p", { className: "text-[10px] text-[#6C709E] mt-0.5" }, "last 7 days")
+          ),
+          h(
+            "div",
+            { className: "bg-[#1E2140] border border-[#282B52] rounded-2xl px-3 py-3 text-center" },
+            h("p", { className: "text-xs text-[#6C709E] font-mono uppercase tracking-wide mb-1" }, "Avg per feed"),
+            h("p", { className: "text-xl font-mono", style: { color: PATTERN_COLOR } }, avgVolume7 != null ? `${avgVolume7} ml` : "—"),
+            h("p", { className: "text-[10px] text-[#6C709E] mt-0.5" }, "last 7 days")
+          )
+        ),
+
+        h(
+          "div",
+          { className: "bg-[#1E2140] border border-[#282B52] rounded-2xl p-4 mb-3" },
+          h("p", { className: "text-xs text-[#6C709E] font-mono uppercase tracking-wide mb-3" }, "Day vs. night · last 7 days"),
+          splitTotalMl > 0
+            ? h(
+                React.Fragment,
+                null,
+                h(
+                  "div",
+                  { className: "flex h-2.5 rounded-full overflow-hidden mb-3" },
+                  h("div", { style: { width: `${dayPct}%`, background: "#F6C453" } }),
+                  h("div", { style: { width: `${nightPct}%`, background: "#5B6099" } })
+                ),
+                h(
+                  "div",
+                  { className: "flex justify-between text-sm" },
+                  h("span", { className: "flex items-center gap-1.5" }, "☀️ ", dayMl, " ml ", h("span", { className: "text-[#6C709E] font-mono text-xs" }, `(${dayPct}%)`)),
+                  h("span", { className: "flex items-center gap-1.5" }, "🌙 ", nightMl, " ml ", h("span", { className: "text-[#6C709E] font-mono text-xs" }, `(${nightPct}%)`))
+                ),
+                h("p", { className: "text-[10px] text-[#6C709E] mt-2" }, "Day = 06:00–18:00, Night = 18:00–06:00")
+              )
+            : h("p", { className: "text-sm text-[#6C709E]" }, "Not enough data yet.")
+        ),
+
+        h(
+          "div",
+          null,
+          h("p", { className: "text-xs text-[#6C709E] font-mono uppercase tracking-wide mb-2 px-1" }, "When feeds happen · last 14 days"),
+          h(
+            "div",
+            { className: "bg-[#1E2140] border border-[#282B52] rounded-2xl p-3" },
+            h(FrequencyLineChart, { data: avgVolumeByTimeData, height: 100, currentIndex: currentBucketIndex })
+          )
+        ),
+
+        h(
+          "div",
+          { className: "mt-3" },
+          h("p", { className: "text-xs text-[#6C709E] font-mono uppercase tracking-wide mb-2 px-1" }, "Avg volume by time · last 14 days"),
+          h(
+            "div",
+            { className: "bg-[#1E2140] border border-[#282B52] rounded-2xl p-3" },
+            h(AvgVolumeChart, { data: avgVolumeByTimeData, height: 110, currentIndex: currentBucketIndex })
+          )
+        )
+      ),
+
+      /* History */
+      h(
+        "div",
+        null,
+        h("h2", { className: "text-sm font-mono uppercase tracking-wide text-[#6C709E] mb-3" }, "Feed history"),
+        historyKeys.length === 0 &&
+          h("p", { className: "text-sm text-[#6C709E] bg-[#1E2140] border border-[#282B52] rounded-2xl p-4" },
+            "No feeds logged yet. Log the next one above — it'll show up here for both of you."),
+        historyKeys.slice(0, visibleDayCount).map((key, idx) => {
+          const dayEntries = historyByDay[key].slice().reverse();
+          const dayTotal = historyByDay[key].reduce((s, e) => s + e.volumeMl, 0);
+          const isExpanded = Object.prototype.hasOwnProperty.call(expandedDays, key) ? expandedDays[key] : idx === 0;
+          return h(
+            "div",
+            { key, className: "mb-2" },
+            h(
+              "button",
+              {
+                onClick: () => setExpandedDays((prev) => ({ ...prev, [key]: !isExpanded })),
+                className: "w-full flex items-center justify-between mb-1.5 px-1 py-1",
+              },
+              h(
+                "span",
+                { className: "flex items-center gap-1.5" },
+                h("span", { className: "text-[#6C709E] text-xs transition-transform inline-block", style: { transform: isExpanded ? "rotate(90deg)" : "rotate(0deg)" } }, "▶"),
+                h("span", { className: "text-sm font-medium" }, fmtDayLabel(key)),
+                h("span", { className: "text-xs text-[#6C709E] font-mono" }, `(${dayEntries.length})`)
+              ),
+              h("span", { className: "text-xs text-[#6C709E] font-mono" }, `${dayTotal} ml`)
+            ),
+            isExpanded &&
+              h(
+                "div",
+                { className: "bg-[#1E2140] border border-[#282B52] rounded-2xl divide-y divide-[#282B52]" },
+                dayEntries.map((e) =>
+                  h(
+                    "div",
+                    { key: e.id, className: "flex items-center gap-3 px-4 py-2.5" },
+                    h("span", { className: "w-2 h-2 rounded-full flex-shrink-0", style: { background: e.type === "breast" ? BREAST_COLOR : FORMULA_COLOR } }),
+                    h(
+                      "div",
+                      { className: "flex-1 min-w-0" },
+                      h("p", { className: "text-sm font-mono" }, fmtTime(e.time)),
+                      h(
+                        "p",
+                        { className: "text-xs text-[#6C709E]" },
+                        `${e.volumeMl} ml`,
+                        e.gapMins != null && h("span", null, ` · +${fmtDuration(e.gapMins)}`)
+                      )
+                    ),
+                    confirmingDeleteId === e.id
+                      ? h(
+                          "div",
+                          { className: "flex items-center gap-1.5 flex-shrink-0" },
+                          h(
+                            "button",
+                            {
+                            onClick: () => handleDelete(e.id),
+                            className: "bg-[#E08A8A] text-[#14162B] text-xs font-semibold rounded-full px-2.5 py-1.5 transition-colors",
+                            "aria-label": "Confirm delete",
+                          },
+                          "Delete?"
+                        ),
+                        h(
+                          "button",
+                          {
+                            onClick: () => setConfirmingDeleteId(null),
+                            className: "bg-[#282B52] text-[#8B8FB0] rounded-full p-1.5 transition-colors",
+                            "aria-label": "Cancel delete",
+                          },
+                          "✕"
+                        )
+                      )
+                    : h(
+                        "button",
+                        {
+                          onClick: () => setConfirmingDeleteId(e.id),
+                          className: "bg-[#282B52] hover:bg-[#3A1F2E] text-[#8B8FB0] hover:text-[#E08A8A] rounded-full p-2 transition-colors flex-shrink-0",
+                          "aria-label": "Delete entry",
+                        },
+                        "✕"
+                      )
+                )
+              )
+            )
+          );
+        }),
+        historyKeys.length > visibleDayCount &&
+          h(
+            "button",
+            {
+              onClick: () => setVisibleDayCount((v) => v + 7),
+              className: "w-full text-center text-xs font-mono text-[#8FA8E0] bg-[#1E2140] border border-[#282B52] rounded-xl py-2.5 mt-1",
+            },
+            `Show 7 more days (${historyKeys.length - visibleDayCount} more available)`
+          )
+      )
+    )
+  );
+}
+
+createRoot(document.getElementById("root")).render(h(App));
+</script>
+</body>
+</html>
