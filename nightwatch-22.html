@@ -1,0 +1,2467 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+<meta name="robots" content="noindex, nofollow" />
+<title>Nightwatch — Feeding Tracker</title>
+<link rel="icon" href="data:," />
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  :root {
+    --bg: #14162B;
+    --card-bg: #1E2140;
+    --card-border: #282B52;
+    --surface-2: #242759;
+    --surface-2-border: #3D4080;
+    --surface-2-border-hover: #565AB0;
+    --text-primary: #EDEEF7;
+    --text-muted: #9195C7;
+    --text-tertiary: #8B8FB0;
+    --text-secondary: #C7CAE8;
+    --pill-bg: #EDEEF7;
+    --pill-text: #14162B;
+  }
+  :root {
+    --gold-text: #F2C879;
+  }
+  [data-theme="light"] {
+    --bg: #F5F2ED;
+    --card-bg: #FFFFFF;
+    --card-border: #E4E1EC;
+    --surface-2: #EEECF5;
+    --surface-2-border: #D3CFE8;
+    --surface-2-border-hover: #B4AEDD;
+    --text-primary: #1C1E33;
+    --text-muted: #6B6E90;
+    --text-tertiary: #7C7FA0;
+    --text-secondary: #4A4D74;
+    --pill-bg: #1C1E33;
+    --pill-text: #FFFFFF;
+    --gold-text: #9C6B0B;
+  }
+  body { background: var(--bg); transition: background 0.6s ease; }
+  .no-scrollbar::-webkit-scrollbar { display: none; }
+  .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+  input, select { color-scheme: dark; }
+  [data-theme="light"] input, [data-theme="light"] select { color-scheme: light; }
+</style>
+</head>
+<body class="text-[var(--text-primary)]" style="font-family: 'Inter', system-ui, sans-serif;">
+<div id="root"></div>
+
+<script type="module">
+import React, { useState, useEffect, useRef, useCallback } from "https://esm.sh/react@18";
+import { createRoot } from "https://esm.sh/react-dom@18/client";
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+import { getAuth, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+
+const h = React.createElement;
+
+/* ---------- CONFIG ---------- */
+const APP_VERSION = "2026.07.10-14";
+const FIREBASE_URL = "https://baby-16d15-default-rtdb.firebaseio.com";
+
+// Fill in FIREBASE_API_KEY (from Firebase Console → Project Settings → General →
+// "Web API Key") and enable Anonymous sign-in (Authentication → Sign-in method)
+// to lock the database down to signed-in requests only. Until you do, the app
+// keeps working exactly as it does now, unauthenticated.
+const FIREBASE_API_KEY = "AIzaSyBJ577YWRVRMJdP9U22G4oi_eh4ID-Jl-k";
+const FIREBASE_PROJECT_ID = "baby-16d15";
+
+const authEnabled = FIREBASE_API_KEY && !FIREBASE_API_KEY.startsWith("YOUR_");
+let firebaseAuth = null;
+if (authEnabled) {
+  const fbApp = initializeApp({
+    apiKey: FIREBASE_API_KEY,
+    authDomain: `${FIREBASE_PROJECT_ID}.firebaseapp.com`,
+    databaseURL: FIREBASE_URL,
+    projectId: FIREBASE_PROJECT_ID,
+  });
+  firebaseAuth = getAuth(fbApp);
+}
+
+let authReadyPromise = null;
+function waitForAuthReady() {
+  if (!authEnabled) return Promise.resolve();
+  if (!authReadyPromise) {
+    authReadyPromise = new Promise((resolve) => {
+      const unsub = onAuthStateChanged(firebaseAuth, () => {
+        unsub();
+        resolve();
+      });
+    });
+  }
+  return authReadyPromise;
+}
+
+async function authedUrl(path) {
+  if (!authEnabled) return `${FIREBASE_URL}${path}`;
+  await waitForAuthReady(); // restores a persisted session from local storage — needs no network
+  if (!firebaseAuth.currentUser) await signInAnonymously(firebaseAuth);
+  const token = await firebaseAuth.currentUser.getIdToken();
+  const sep = path.includes("?") ? "&" : "?";
+  return `${FIREBASE_URL}${path}${sep}auth=${token}`;
+}
+
+// Get a free key at console.groq.com/keys (no credit card required) and
+// paste it below. Note: we tried hiding this behind a Cloudflare Worker
+// proxy, but Groq's own edge protection blocks traffic from Cloudflare's
+// network — so this has to be called directly from the browser. GitHub's
+// secret scanner will periodically flag this key; just generate a new one
+// and swap it in when that happens.
+// The Groq API key is no longer hardcoded here — it's stored in Firebase and
+// editable from inside the app itself (see the AI insight panel), so
+// rotating it never requires a code change or a redeploy.
+const GROQ_MODEL = "llama-3.3-70b-versatile";
+
+// Permanent — baby's actual birth date, used to give the AI insight accurate age context.
+const BABY_BIRTH_DATE = "2026-05-13";
+
+function babyAgeSummary(nowDate) {
+  const days = Math.floor((keyToUTCms(dayKey(nowDate)) - keyToUTCms(BABY_BIRTH_DATE)) / 86400000);
+  if (days < 0) return "";
+  const weeks = Math.floor(days / 7);
+  const months = Math.floor(days / 30.44);
+  return `Baby was born ${BABY_BIRTH_DATE} and is currently ${days} days old (about ${weeks} weeks${months >= 1 ? `, roughly ${months} month${months === 1 ? "" : "s"}` : ""} old).`;
+}
+function renderBoldText(text) {
+  if (!text) return text;
+  const parts = text.split(/(\*\*[^*]+\*\*)/g);
+  return parts.map((part, i) => {
+    if (part.startsWith("**") && part.endsWith("**")) {
+      return h("strong", { key: i, style: { color: "var(--text-primary)", fontWeight: 700 } }, part.slice(2, -2));
+    }
+    return part;
+  });
+}
+function babyAgeShort(nowDate) {
+  const days = Math.floor((keyToUTCms(dayKey(nowDate)) - keyToUTCms(BABY_BIRTH_DATE)) / 86400000);
+  if (days < 0) return "";
+  const weeks = Math.floor(days / 7);
+  const remDays = days % 7;
+  const months = Math.floor(days / 30.44);
+  if (months >= 2) return `${months} months old`;
+  return `${weeks}w ${remDays}d old`;
+}
+
+function computeInsightSlot(nowDate) {
+  const p = tzParts(nowDate);
+  const today = dayKey(nowDate);
+  if (p.hour < 6) return `${shiftDayKey(today, -1)}-evening`;
+  if (p.hour < 18) return `${today}-morning`;
+  return `${today}-evening`;
+}
+
+const FEEDING_SYSTEM_PROMPT =
+  "You are a precise infant-feeding intake calculator helping two tired parents figure out if they should feed " +
+  "more today, and exactly where. Not a doctor — no diagnosis, no medical advice, just arithmetic and pattern " +
+  "reading grounded strictly in the numbers given. " +
+  "Do this every time, in order: (1) Work out a reasonable expected total intake for TODAY using the 7-day daily " +
+  "average as the baseline, adjusted for whether the last 3 days trend above or below that average. Bold this " +
+  "target, e.g. **~750 ml today**. (2) Compare it to today's actual total so far, accounting for how much of the " +
+  "day has already passed — don't flag a shortfall just because it's early. (3) If today looks like it will land " +
+  "short of the target at the current pace, say by how much extra is needed, in bold, e.g. **about 60 ml more**. " +
+  "(4) Using the average-volume-by-time-window data given, name the SPECIFIC upcoming 3-hour window where a " +
+  "top-up would fit best, and bold the extra amount to aim for at that feed, e.g. the 18-21 window, add **20-25 " +
+  "ml**. (5) If today is already on pace or ahead of the target, say so plainly and bold that reassurance instead " +
+  "of inventing a shortfall. Bold (using **double asterisks**) only the key numbers and the core recommendation — " +
+  "nothing else. No headers, no bullet points, 3-5 short sentences, warm and plain-spoken.";
+
+const SLEEP_SYSTEM_PROMPT =
+  "You are a sharp, specific infant-sleep pattern analyst helping two tired parents who already know the basics — " +
+  "they don't need reassurance filler, they need you to actually look at the numbers. " +
+  "You are not a doctor and must never diagnose or give medical advice — you may use age (and weight, if given) " +
+  "only to judge whether sleep patterns look broadly typical for that age. " +
+  "Hard requirements: (1) Reference at least 3 specific numbers from the data provided, by name (e.g. 'your 45 " +
+  "minute average wake window' or 'the 68/32 day-night sleep split'). (2) Identify ONE specific thing that stands " +
+  "out — a trend, an imbalance, a comparison between today and the 7-day average, or a milestone like a long night " +
+  "stretch — not a generic statement that could apply to any baby. (3) Never say things like 'every baby is " +
+  "different' without immediately following it with a specific number from THIS data. (4) If today's numbers are " +
+  "simply in line with the 7-day average, say that plainly and briefly. (5) Suggest checking with their " +
+  "pediatrician only if something in the actual numbers looks genuinely notable. Bold (using **double asterisks**) " +
+  "only the key numbers and the one standout observation — nothing else. Keep it to 3-4 short sentences, " +
+  "warm and plain-spoken, no headers, no bullet points.";
+
+async function generateInsightText(summary, systemPrompt, apiKey) {
+  const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
+    body: JSON.stringify({
+      model: GROQ_MODEL,
+      temperature: 0.9,
+      max_tokens: 300,
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: summary },
+      ],
+    }),
+  });
+  if (!res.ok) {
+    const errBody = await res.text().catch(() => "");
+    throw new Error(`Groq request failed (${res.status}): ${errBody.slice(0, 200)}`);
+  }
+  const data = await res.json();
+  const text = data?.choices?.[0]?.message?.content || "";
+  if (!text) throw new Error("empty response");
+  return text.trim();
+}
+
+/* ---------- OFFLINE CACHE + PENDING WRITE QUEUE ---------- */
+const CACHE_KEY = "nightwatch_cache_v1";
+const SLEEP_CACHE_KEY = "nightwatch_sleep_cache_v1";
+const QUEUE_KEY = "nightwatch_queue_v1";
+
+function loadCache(key) {
+  try {
+    return JSON.parse(localStorage.getItem(key) || "[]");
+  } catch (e) {
+    return [];
+  }
+}
+function saveCache(key, data) {
+  try {
+    localStorage.setItem(key, JSON.stringify(data));
+  } catch (e) {}
+}
+function loadQueue() {
+  try {
+    return JSON.parse(localStorage.getItem(QUEUE_KEY) || "[]");
+  } catch (e) {
+    return [];
+  }
+}
+function saveQueue(q) {
+  try {
+    localStorage.setItem(QUEUE_KEY, JSON.stringify(q));
+  } catch (e) {}
+}
+
+async function safeFetch(url, options) {
+  let res;
+  try {
+    res = await fetch(url, options);
+  } catch (networkErr) {
+    const err = new Error("Network unreachable");
+    err.isNetworkError = true;
+    throw err;
+  }
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    const err = new Error(`Request rejected (${res.status}): ${body.slice(0, 150)}`);
+    err.isNetworkError = false;
+    err.status = res.status;
+    throw err;
+  }
+  return res;
+}
+
+const BREAST_COLOR = "#F2C879";
+const FORMULA_COLOR = "#8FA8E0";
+const PATTERN_COLOR = "#B39DFF";
+const VOLUME_COLOR = "#7FD9A8";
+const SLEEP_NAP_COLOR = PATTERN_COLOR;
+const SLEEP_NIGHT_COLOR = "#5B6099";
+const SLEEP_DURATION_COLOR = "#6FC7C1";
+const ML_PER_OZ = 29.5735;
+
+// Pinned to a fixed timezone so both phones agree on "today", hour-of-day
+// buckets, and displayed times — regardless of each device's own clock
+// settings. Based on your current UTC+7 offset (Vietnam/Thailand/etc, no DST).
+// If this is wrong for where you actually are, tell me and I'll change it.
+const APP_TIMEZONE = "Asia/Bangkok";
+const APP_TZ_OFFSET_MINUTES = 420; // UTC+7, no DST — used to convert picked wall-clock time to a correct instant
+
+function tzWallTimeToISO(dateKey, hour, minute) {
+  const [y, m, d] = dateKey.split("-").map(Number);
+  const utcMs = Date.UTC(y, m - 1, d, hour, minute) - APP_TZ_OFFSET_MINUTES * 60000;
+  return new Date(utcMs).toISOString();
+}
+
+function tzParts(d) {
+  const dtf = new Intl.DateTimeFormat("en-US", {
+    timeZone: APP_TIMEZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+  const map = {};
+  dtf.formatToParts(new Date(d)).forEach((p) => { map[p.type] = p.value; });
+  let hour = parseInt(map.hour, 10);
+  if (hour === 24) hour = 0;
+  return {
+    year: parseInt(map.year, 10),
+    month: parseInt(map.month, 10),
+    day: parseInt(map.day, 10),
+    hour,
+    minute: parseInt(map.minute, 10),
+  };
+}
+function hourInTZ(d) {
+  return tzParts(d).hour;
+}
+
+/* ---------- HELPERS ---------- */
+function uid() {
+  return `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+}
+function isRecentEntry(entry, withinMs = 120000) {
+  const ts = parseInt(String(entry.id).split("-")[0], 10);
+  return !isNaN(ts) && Date.now() - ts < withinMs;
+}
+function mergeById(latest, local) {
+  const map = new Map();
+  latest.forEach((e) => map.set(e.id, e));
+  local.forEach((e) => {
+    if (!map.has(e.id) && isRecentEntry(e)) map.set(e.id, e);
+  });
+  return Array.from(map.values());
+}
+function dayKey(d) {
+  const p = tzParts(d);
+  return `${p.year}-${String(p.month).padStart(2, "0")}-${String(p.day).padStart(2, "0")}`;
+}
+function keyToUTCms(key) {
+  const [y, m, dd] = key.split("-").map(Number);
+  return Date.UTC(y, m - 1, dd);
+}
+function shiftDayKey(key, deltaDays) {
+  const dt = new Date(keyToUTCms(key) + deltaDays * 86400000);
+  return `${dt.getUTCFullYear()}-${String(dt.getUTCMonth() + 1).padStart(2, "0")}-${String(dt.getUTCDate()).padStart(2, "0")}`;
+}
+function fmtTime(d) {
+  return new Date(d).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false, timeZone: APP_TIMEZONE });
+}
+function fmtDayLabel(dOrKey) {
+  const key = typeof dOrKey === "string" ? dOrKey : dayKey(dOrKey);
+  const todayKey = dayKey(new Date());
+  if (key === todayKey) return "Today";
+  const diffDays = Math.round((keyToUTCms(todayKey) - keyToUTCms(key)) / 86400000);
+  if (diffDays === 1) return "Yesterday";
+  return new Date(keyToUTCms(key)).toLocaleDateString([], { weekday: "short", month: "numeric", day: "numeric", timeZone: "UTC" });
+}
+function fmtDuration(mins) {
+  if (mins == null) return null;
+  const m = Math.round(mins);
+  const hh = Math.floor(m / 60);
+  const rem = m % 60;
+  if (hh <= 0) return `${rem}m`;
+  if (rem === 0) return `${hh}h`;
+  return `${hh}h${String(rem).padStart(2, "0")}`;
+}
+/* ---------- SMALL UI PIECES ---------- */
+function TimeWheelColumn({ values, value, onChange, format }) {
+  const itemH = 30;
+  const visibleH = 90;
+  const pad = (visibleH - itemH) / 2;
+  const containerRef = useRef(null);
+  const scrollTimeout = useRef(null);
+  const didInit = useRef(false);
+
+  useEffect(() => {
+    const idx = values.indexOf(value);
+    if (containerRef.current && idx >= 0) {
+      containerRef.current.scrollTop = idx * itemH;
+      didInit.current = true;
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!didInit.current) return;
+    const idx = values.indexOf(value);
+    const el = containerRef.current;
+    if (el && idx >= 0 && Math.round(el.scrollTop / itemH) !== idx) {
+      el.scrollTop = idx * itemH;
+    }
+  }, [value]);
+
+  function settleToNearest() {
+    const el = containerRef.current;
+    if (!el) return;
+    const idx = Math.max(0, Math.min(values.length - 1, Math.round(el.scrollTop / itemH)));
+    if (values[idx] !== value) onChange(values[idx]);
+  }
+
+  function handleScroll() {
+    if (scrollTimeout.current) clearTimeout(scrollTimeout.current);
+    scrollTimeout.current = setTimeout(settleToNearest, 160);
+  }
+
+  function jumpTo(v) {
+    const idx = values.indexOf(v);
+    const el = containerRef.current;
+    if (el && idx >= 0) el.scrollTo({ top: idx * itemH, behavior: "smooth" });
+    onChange(v);
+  }
+
+  return h(
+    "div",
+    { className: "relative", style: { width: 56 } },
+    h("div", {
+      className: "pointer-events-none absolute left-0 right-0 top-1/2 -translate-y-1/2 z-10 border-y border-[#F2C879]/40 bg-[#F2C879]/5",
+      style: { height: itemH },
+    }),
+    h(
+      "div",
+      {
+        ref: containerRef,
+        onScroll: handleScroll,
+        className: "overflow-y-scroll no-scrollbar",
+        style: { height: visibleH, scrollSnapType: "y proximity" },
+      },
+      h("div", { style: { height: pad } }),
+      values.map((v) =>
+        h(
+          "div",
+          {
+            key: v,
+            onClick: () => jumpTo(v),
+            className: "flex items-center justify-center font-mono cursor-pointer",
+            style: {
+              height: itemH,
+              scrollSnapAlign: "center",
+              fontSize: v === value ? "17px" : "13px",
+              fontWeight: v === value ? 700 : 400,
+              color: v === value ? "var(--text-primary)" : "#8286B8",
+            },
+          },
+          format ? format(v) : v
+        )
+      ),
+      h("div", { style: { height: pad } })
+    )
+  );
+}
+
+function VolumeWheel({ value, onChange }) {
+  const values = [];
+  for (let v = 30; v <= 160; v += 5) values.push(v);
+  const itemW = 26;
+  const visibleW = 280;
+  const pad = (visibleW - itemW) / 2;
+  const containerRef = useRef(null);
+  const scrollTimeout = useRef(null);
+  const didInit = useRef(false);
+
+  useEffect(() => {
+    if (didInit.current) return;
+    const idx = values.indexOf(value);
+    if (containerRef.current && idx >= 0) {
+      containerRef.current.scrollLeft = idx * itemW;
+      didInit.current = true;
+    }
+  }, []);
+
+  function settleToNearest() {
+    const el = containerRef.current;
+    if (!el) return;
+    const idx = Math.max(0, Math.min(values.length - 1, Math.round(el.scrollLeft / itemW)));
+    // Native CSS scroll-snap already settles the visual position — we just
+    // sync the value, rather than issuing a second competing scrollTo(),
+    // which is what was causing the jerky double-snap feel.
+    if (values[idx] !== value) onChange(values[idx]);
+  }
+
+  function handleScroll() {
+    if (scrollTimeout.current) clearTimeout(scrollTimeout.current);
+    scrollTimeout.current = setTimeout(settleToNearest, 160);
+  }
+
+  function jumpTo(v) {
+    const idx = values.indexOf(v);
+    const el = containerRef.current;
+    if (el && idx >= 0) el.scrollTo({ left: idx * itemW, behavior: "smooth" });
+    onChange(v);
+  }
+
+  return h(
+    "div",
+    { className: "select-none" },
+    h(
+      "div",
+      { className: "text-center mb-1.5" },
+      h("span", { className: "text-3xl", style: { fontFamily: "'Fraunces', Georgia, serif", fontWeight: 600 } }, value),
+      h("span", { className: "text-sm text-[var(--text-muted)] font-mono ml-1" }, "ml")
+    ),
+    h(
+      "div",
+      { className: "relative mx-auto", style: { width: visibleW } },
+      h("div", {
+        className: "pointer-events-none absolute left-1/2 -translate-x-1/2 top-0 bottom-0 w-0.5 z-10 rounded",
+        style: { background: "#F2C879" },
+      }),
+      h(
+        "div",
+        {
+          ref: containerRef,
+          onScroll: handleScroll,
+          className: "overflow-x-scroll no-scrollbar flex",
+          style: { width: visibleW, scrollSnapType: "x proximity", scrollBehavior: "smooth" },
+        },
+        h("div", { style: { width: pad, flexShrink: 0 } }),
+        values.map((v) => {
+          const isMajor = (v - 30) % 20 === 0;
+          const isSelected = v === value;
+          return h(
+            "div",
+            {
+              key: v,
+              onClick: () => jumpTo(v),
+              className: "flex flex-col items-center justify-end cursor-pointer flex-shrink-0",
+              style: { width: itemW, height: 38, scrollSnapAlign: "center" },
+            },
+            h("div", {
+              style: {
+                width: isSelected ? 2.5 : 1.5,
+                height: isMajor ? 18 : 9,
+                background: isSelected ? "#F2C879" : "#4A4E85",
+                borderRadius: 2,
+              },
+            }),
+            h(
+              "span",
+              { className: "text-[8px] font-mono mt-1", style: { color: "var(--text-muted)", visibility: isMajor ? "visible" : "hidden" } },
+              v
+            )
+          );
+        }),
+        h("div", { style: { width: pad, flexShrink: 0 } })
+      )
+    )
+  );
+}
+
+function IconBtn({ onClick, children, className, label }) {
+  return h(
+    "button",
+    { onClick, "aria-label": label, className: `bg-[var(--surface-2)] border border-[var(--surface-2-border)] hover:border-[var(--surface-2-border-hover)] text-[var(--text-secondary)] rounded-full transition-colors ${className || ""}` },
+    children
+  );
+}
+
+function GroqKeySetup({ groqKeyDraft, setGroqKeyDraft, saveGroqApiKey }) {
+  return h(
+    "div",
+    null,
+    h(
+      "p",
+      { className: "text-xs text-[var(--text-tertiary)] leading-relaxed mb-2" },
+      "Get a free key at console.groq.com/keys (no card needed), paste it below:"
+    ),
+    h(
+      "div",
+      { className: "flex gap-1.5" },
+      h("input", {
+        value: groqKeyDraft,
+        onChange: (e) => setGroqKeyDraft(e.target.value),
+        onKeyDown: (e) => e.key === "Enter" && saveGroqApiKey(),
+        type: "text",
+        placeholder: "gsk_...",
+        className: "flex-1 min-w-0 bg-[var(--surface-2)] border border-[var(--surface-2-border)] rounded-lg px-2 py-1 text-xs outline-none focus:border-[#8FA8E0] font-mono",
+      }),
+      h("button", { onClick: saveGroqApiKey, className: "bg-[#F2C879] text-[#14162B] rounded-lg px-3 text-xs font-semibold" }, "Save")
+    )
+  );
+}
+
+function SummaryCard({ label, value, unit, accent }) {
+  return h(
+    "div",
+    { className: "bg-[var(--card-bg)] border border-[var(--card-border)] rounded-2xl px-3 py-3 text-center" },
+    h("p", { className: "text-xs text-[var(--text-muted)] font-mono uppercase tracking-wide mb-1" }, label),
+    h(
+      "p",
+      { className: "text-xl font-mono", style: { color: accent } },
+      value,
+      h("span", { className: "text-xs text-[var(--text-muted)] ml-0.5" }, unit)
+    )
+  );
+}
+
+function TypeButton({ active, color, emoji, label, onClick }) {
+  return h(
+    "button",
+    {
+      onClick,
+      className: "flex-1 flex items-center justify-center gap-2 rounded-xl py-3 text-sm font-medium border-2 transition-all " + (active ? "" : "bg-[var(--surface-2)] border-[var(--surface-2-border)] text-[var(--text-secondary)]"),
+      style: active ? { background: color, borderColor: color, color: "#14162B" } : undefined,
+    },
+    h("span", null, emoji),
+    label
+  );
+}
+
+function StackedBarChart({ data, height, selectedIndex, onSelect, keyA = "breast", keyB = "formula", colorA = BREAST_COLOR, colorB = FORMULA_COLOR }) {
+  const max = Math.max(1, ...data.map((d) => d[keyA] + d[keyB]));
+  const barAreaH = height - 40;
+  return h(
+    "div",
+    { className: "flex items-end justify-between", style: { height } },
+    data.map((d, i) => {
+      const total = d[keyA] + d[keyB];
+      const isSelected = selectedIndex === i;
+      return h(
+        "div",
+        {
+          key: d.label,
+          onClick: () => onSelect(i),
+          className: "flex flex-col items-center flex-1 gap-1 cursor-pointer",
+        },
+        h("span", { className: "text-[9px] font-mono", style: { color: isSelected ? "var(--text-primary)" : "var(--text-muted)" } }, total || ""),
+        h(
+          "div",
+          {
+            className: "flex flex-col-reverse w-4 rounded-sm overflow-hidden",
+            style: {
+              height: barAreaH,
+              boxShadow: isSelected ? "0 0 0 2px #F2C879" : "none",
+            },
+          },
+          h("div", { style: { height: Math.max(0, (d[keyA] / max) * barAreaH), background: colorA, width: "100%" } }),
+          h("div", { style: { height: Math.max(0, (d[keyB] / max) * barAreaH), background: colorB, width: "100%" } })
+        ),
+        h("span", { className: "text-[9px] font-mono", style: { color: isSelected ? "var(--text-primary)" : "var(--text-muted)" } }, d.label)
+      );
+    })
+  );
+}
+
+function FrequencyLineChart({ data, height, currentIndex }) {
+  const w = 280;
+  const marginX = 16;
+  const padTop = 18;
+  const padBottom = 22;
+  const plotH = height - padTop - padBottom;
+  const plotW = w - marginX * 2;
+  const max = Math.max(10, ...data.map((d) => d.pct));
+  const stepX = plotW / (data.length - 1);
+  const points = data.map((d, i) => ({
+    ...d,
+    x: marginX + i * stepX,
+    y: padTop + (1 - d.pct / max) * plotH,
+  }));
+  const pathD = points.map((p, i) => `${i === 0 ? "M" : "L"}${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(" ");
+  return h(
+    "div",
+    { className: "w-full" },
+    h(
+      "svg",
+      { viewBox: `0 0 ${w} ${height}`, width: "100%", height, preserveAspectRatio: "none", style: { overflow: "visible" } },
+      h("path", { d: pathD, fill: "none", stroke: PATTERN_COLOR, strokeWidth: 2 }),
+      points.map((p, i) =>
+        h(
+          "g",
+          { key: p.label },
+          h("circle", { cx: p.x, cy: p.y, r: i === currentIndex ? 4 : 3, fill: i === currentIndex ? "#F2C879" : PATTERN_COLOR }),
+          h(
+            "text",
+            { x: p.x, y: Math.max(9, p.y - 8), fontSize: 8, fill: i === currentIndex ? "var(--gold-text)" : "var(--text-tertiary)", textAnchor: "middle", fontFamily: "monospace", fontWeight: i === currentIndex ? "bold" : "normal" },
+            `${p.pct}%`
+          ),
+          h(
+            "text",
+            { x: p.x, y: height - 6, fontSize: 8, fill: i === currentIndex ? "var(--gold-text)" : "var(--text-muted)", textAnchor: "middle", fontFamily: "monospace", fontWeight: i === currentIndex ? "bold" : "normal" },
+            p.label
+          )
+        )
+      )
+    )
+  );
+}
+
+function AvgVolumeChart({ data, height, currentIndex, unit = "ml", noun = "feed", color = VOLUME_COLOR }) {
+  const max = Math.max(1, ...data.map((d) => d.value));
+  const barAreaH = height - 30;
+  return h(
+    "div",
+    { className: "flex items-start justify-between gap-1.5 px-2", style: { height } },
+    data.map((d, i) => {
+      const isNow = i === currentIndex;
+      return h(
+        "div",
+        { key: d.label, className: "flex flex-col items-center flex-1 relative" },
+        h("span", { className: "text-[9px] font-mono mb-1", style: { color: isNow ? "var(--gold-text)" : "var(--text-muted)" } }, d.count ? d.value : "—"),
+        h(
+          "div",
+          { className: "flex flex-col-reverse w-full", style: { height: barAreaH } },
+          h("div", {
+            className: "w-full rounded-sm",
+            style: {
+              height: Math.max(1, (d.value / max) * barAreaH),
+              background: color,
+              opacity: d.count ? 1 : 0.15,
+              boxShadow: isNow ? "0 0 0 1.5px #F2C879" : "none",
+            },
+            title: `${d.label}: ${d.count ? `${d.value} ${unit} avg (${d.count} ${noun}${d.count === 1 ? "" : "s"})` : "no data"}`,
+          })
+        ),
+        h("span", { className: "text-[8px] font-mono mt-1", style: { color: isNow ? "var(--gold-text)" : "var(--text-muted)" } }, d.label)
+      );
+    })
+  );
+}
+
+/* ---------- APP ---------- */
+function buildInsightSummary(entries, nowDate, weightKg) {
+  const sorted = [...entries].sort((a, b) => new Date(a.time) - new Date(b.time));
+  const now = nowDate;
+  const todayKeyNow = dayKey(now);
+  const last7Cutoff = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+  const last7 = sorted.filter((e) => new Date(e.time) >= last7Cutoff);
+
+  const todayEntries = sorted.filter((e) => dayKey(new Date(e.time)) === todayKeyNow);
+  const todayTotalMl = todayEntries.reduce((s, e) => s + e.volumeMl, 0);
+
+  const gaps = [];
+  for (let i = 1; i < last7.length; i++) gaps.push((new Date(last7[i].time) - new Date(last7[i - 1].time)) / 60000);
+  const avgIntervalMins = gaps.length ? Math.round(gaps.reduce((a, b) => a + b, 0) / gaps.length) : null;
+  const avgVolume = last7.length ? Math.round(last7.reduce((s, e) => s + e.volumeMl, 0) / last7.length) : null;
+
+  let dayMl = 0, nightMl = 0;
+  last7.forEach((e) => {
+    const hh = hourInTZ(e.time);
+    if (hh >= 6 && hh < 18) dayMl += e.volumeMl;
+    else nightMl += e.volumeMl;
+  });
+  const splitTotal = dayMl + nightMl;
+  const dayPct = splitTotal ? Math.round((dayMl / splitTotal) * 100) : null;
+
+  const lastEntry = sorted[sorted.length - 1];
+  const minsSinceLast = lastEntry ? Math.round((now - new Date(lastEntry.time)) / 60000) : null;
+
+  const last3DayTotals = [];
+  for (let i = 0; i < 3; i++) {
+    const key = shiftDayKey(todayKeyNow, -i);
+    const dayEntries = sorted.filter((e) => dayKey(new Date(e.time)) === key);
+    last3DayTotals.push(`${key}: ${dayEntries.reduce((s, e) => s + e.volumeMl, 0)}ml over ${dayEntries.length} feeds`);
+  }
+
+  const yesterdayKey = shiftDayKey(todayKeyNow, -1);
+  const yesterdayEntries = sorted.filter((e) => dayKey(new Date(e.time)) === yesterdayKey);
+  const yesterdayTotalMl = yesterdayEntries.reduce((s, e) => s + e.volumeMl, 0);
+  const avgDailyMl7 = last7.length
+    ? Math.round(
+        Array.from({ length: 7 }, (_, i) => shiftDayKey(todayKeyNow, -i))
+          .map((key) => sorted.filter((e) => dayKey(new Date(e.time)) === key).reduce((s, e) => s + e.volumeMl, 0))
+          .reduce((a, b) => a + b, 0) / 7
+      )
+    : null;
+
+  const maxGapMins = gaps.length ? Math.round(Math.max(...gaps)) : null;
+
+  const last14Cutoff = new Date(now.getTime() - 14 * 24 * 60 * 60 * 1000);
+  const last14 = sorted.filter((e) => new Date(e.time) >= last14Cutoff);
+  const buckets = Array.from({ length: 8 }, (_, i) => ({ hourStart: i * 3, totalMl: 0, count: 0 }));
+  last14.forEach((e) => {
+    const idx = Math.floor(hourInTZ(e.time) / 3);
+    buckets[idx].totalMl += e.volumeMl;
+    buckets[idx].count += 1;
+  });
+  const bucketSummary = buckets
+    .map((b) => `${b.hourStart}-${b.hourStart + 3}h avg ${b.count ? Math.round(b.totalMl / b.count) : 0}ml (${b.count} feeds)`)
+    .join("; ");
+  const currentHour = hourInTZ(now);
+  const dayFractionElapsed = Math.round((currentHour / 24) * 100);
+
+  return [
+    babyAgeSummary(now),
+    weightKg ? `Baby's current weight: ${weightKg} kg (this is a manually-logged value that stays current until the parents update it again — treat it as accurate for today's context, not a fresh daily measurement).` : "",
+    `Total feeds logged: ${sorted.length}.`,
+    avgIntervalMins != null ? `Average interval between feeds (last 7 days): ${avgIntervalMins} minutes.` : "Not enough feeds yet for an interval average.",
+    maxGapMins != null ? `Longest gap between feeds in the last 7 days: ${maxGapMins} minutes.` : "",
+    avgVolume != null ? `Average volume per feed (last 7 days): ${avgVolume} ml.` : "",
+    dayPct != null ? `Day (06:00-18:00) vs night (18:00-06:00) split (last 7 days): ${dayPct}% day, ${100 - dayPct}% night.` : "",
+    avgDailyMl7 != null ? `Average total ml per day over the last 7 days: ${avgDailyMl7} ml.` : "",
+    `Yesterday's total: ${yesterdayTotalMl} ml across ${yesterdayEntries.length} feeds.`,
+    `Today's total so far: ${todayTotalMl} ml across ${todayEntries.length} feeds (note: today may still be in progress, so a lower total than average isn't necessarily a real drop — only flag it if it's still notably low by the end of the day).`,
+    minsSinceLast != null ? `Minutes since the most recent feed: ${minsSinceLast}.` : "",
+    `Last 3 days: ${last3DayTotals.join("; ")}.`,
+    `Current time is ${fmtTime(now)} — roughly ${dayFractionElapsed}% of the day has elapsed.`,
+    `Average volume by 3-hour window over the last 14 days: ${bucketSummary}.`,
+  ].filter(Boolean).join(" ");
+}
+
+function buildSleepInsightSummary(sleepSessions, nowDate, weightKg) {
+  const sorted = [...sleepSessions].sort((a, b) => new Date(a.startTime) - new Date(b.startTime));
+  const now = nowDate;
+  const todayKeyNow = dayKey(now);
+  function durationMins(s) {
+    const end = s.endTime ? new Date(s.endTime) : now;
+    return (end - new Date(s.startTime)) / 60000;
+  }
+  const completed = sorted.filter((s) => s.endTime);
+  const ongoing = sorted.find((s) => !s.endTime);
+  const last7Cutoff = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+  const last7 = completed.filter((s) => new Date(s.startTime) >= last7Cutoff);
+
+  const avgNapsPerDay = last7.length ? Math.round((last7.length / 7) * 10) / 10 : null;
+  const avgNapDurationMins = last7.length ? Math.round(last7.reduce((sum, s) => sum + durationMins(s), 0) / last7.length) : null;
+  const longestStretchMins = last7.length ? Math.round(Math.max(...last7.map(durationMins))) : null;
+
+  const wakeGaps = [];
+  for (let i = 1; i < completed.length; i++) {
+    if (new Date(completed[i].startTime) >= last7Cutoff) {
+      wakeGaps.push((new Date(completed[i].startTime) - new Date(completed[i - 1].endTime)) / 60000);
+    }
+  }
+  const avgWakeWindowMins = wakeGaps.length ? Math.round(wakeGaps.reduce((a, b) => a + b, 0) / wakeGaps.length) : null;
+
+  let dayMins = 0, nightMins = 0;
+  last7.forEach((s) => {
+    const hh = hourInTZ(s.startTime);
+    const mins = durationMins(s);
+    if (hh >= 6 && hh < 18) dayMins += mins;
+    else nightMins += mins;
+  });
+  const splitTotal = dayMins + nightMins;
+  const dayPct = splitTotal ? Math.round((dayMins / splitTotal) * 100) : null;
+
+  const todayAll = sorted.filter((s) => dayKey(new Date(s.startTime)) === todayKeyNow);
+  const todayTotalMins = todayAll.reduce((sum, s) => sum + durationMins(s), 0);
+
+  const yesterdayKey = shiftDayKey(todayKeyNow, -1);
+  const yesterdayAll = sorted.filter((s) => dayKey(new Date(s.startTime)) === yesterdayKey);
+  const yesterdayTotalMins = yesterdayAll.reduce((sum, s) => sum + durationMins(s), 0);
+
+  const avgDailyMins7 = last7.length
+    ? Math.round(
+        Array.from({ length: 7 }, (_, i) => shiftDayKey(todayKeyNow, -i))
+          .map((key) => sorted.filter((s) => dayKey(new Date(s.startTime)) === key).reduce((sum, s) => sum + durationMins(s), 0))
+          .reduce((a, b) => a + b, 0) / 7
+      )
+    : null;
+
+  return [
+    babyAgeSummary(now),
+    weightKg ? `Baby's current weight: ${weightKg} kg (a manually-logged value that stays current until updated).` : "",
+    `Total sleep sessions logged: ${sorted.length}.`,
+    ongoing ? `Baby is currently asleep, started at ${new Date(ongoing.startTime).toISOString()}.` : "Baby is currently awake.",
+    avgNapsPerDay != null ? `Average number of sleep sessions per day (last 7 days): ${avgNapsPerDay}.` : "Not enough sleep data yet.",
+    avgNapDurationMins != null ? `Average sleep session length (last 7 days): ${fmtDuration(avgNapDurationMins)}.` : "",
+    longestStretchMins != null ? `Longest single sleep stretch in the last 7 days: ${fmtDuration(longestStretchMins)}.` : "",
+    avgWakeWindowMins != null ? `Average awake time between sleep sessions (last 7 days): ${fmtDuration(avgWakeWindowMins)}.` : "",
+    dayPct != null ? `Day (06:00-18:00) vs night (18:00-06:00) sleep split (last 7 days): ${dayPct}% day, ${100 - dayPct}% night.` : "",
+    avgDailyMins7 != null ? `Average total sleep per day over the last 7 days: ${fmtDuration(avgDailyMins7)}.` : "",
+    `Yesterday's total sleep: ${fmtDuration(yesterdayTotalMins) || "0m"} across ${yesterdayAll.length} sessions.`,
+    `Today's total sleep so far: ${fmtDuration(todayTotalMins) || "0m"} across ${todayAll.length} sessions (today may still be in progress).`,
+  ].filter(Boolean).join(" ");
+}
+
+function SleepTimePicker({ label, dateKey, setDateKey, hour, setHour, minute, setMinute }) {
+  return h(
+    "div",
+    { className: "mb-3" },
+    h("p", { className: "text-[10px] text-[var(--text-muted)] font-mono uppercase tracking-wide mb-1.5" }, label),
+    h(
+      "div",
+      { className: "flex gap-2 mb-2" },
+      [0, -1].map((delta) => {
+        const key = shiftDayKey(dayKey(new Date()), delta);
+        const lbl = delta === 0 ? "Today" : "Yesterday";
+        const isSel = dateKey === key;
+        return h(
+          "button",
+          {
+            key: lbl,
+            onClick: () => setDateKey(key),
+            className: "flex-1 py-1.5 rounded-lg text-xs border transition-colors " +
+              (isSel ? "bg-[var(--pill-bg)] text-[var(--pill-text)] border-[var(--pill-bg)]" : "bg-[var(--surface-2)] border-[var(--surface-2-border)] text-[var(--text-secondary)]"),
+          },
+          lbl
+        );
+      }),
+      h("input", {
+        type: "date",
+        value: dateKey,
+        max: dayKey(new Date()),
+        onChange: (e) => setDateKey(e.target.value),
+        className: "flex-1 bg-[var(--surface-2)] border border-[var(--surface-2-border)] rounded-lg px-2 text-xs text-[var(--text-primary)] outline-none focus:border-[#8FA8E0] font-mono",
+      })
+    ),
+    h(
+      "div",
+      { className: "flex items-center justify-center gap-1 bg-[var(--surface-2)] border border-[var(--surface-2-border)] rounded-lg py-1" },
+      h(TimeWheelColumn, { values: Array.from({ length: 24 }, (_, hh) => hh), value: hour, onChange: setHour, format: (v) => String(v).padStart(2, "0") }),
+      h("span", { className: "font-mono text-lg text-[var(--text-muted)]" }, ":"),
+      h(TimeWheelColumn, { values: Array.from({ length: 12 }, (_, i) => i * 5), value: minute, onChange: setMinute, format: (v) => String(v).padStart(2, "0") }),
+      h("span", { className: "text-[10px] text-[var(--text-muted)] font-mono ml-1" }, "24h")
+    )
+  );
+}
+
+function SleepTab(props) {
+  const {
+    isAsleep, sleepStatusMins, showWakeWarning, ongoingSleep, lastCompletedSleep,
+    todaySleepTotalMins, todayNapCount, todayLongestStretchMins,
+    sleepTrendData, selectedSleepTrendDay, setSelectedSleepTrendDay,
+    avgNapsPerDay7, avgNapDurationMins7, longestStretchMins7, avgWakeWindowMins7,
+    sleepDayMins, sleepNightMins, sleepDayPct,
+    sleepBucketData, currentBucketIndex,
+    sleepHistoryKeys, sleepHistoryByDay, visibleSleepDayCount, setVisibleSleepDayCount,
+    expandedSleepDays, setExpandedSleepDays,
+    confirmingDeleteSleepId, setConfirmingDeleteSleepId, handleDeleteSleep,
+    toggleSleep, sleepSubmitting,
+    loggingPastSleep, setLoggingPastSleep,
+    sleepStartDateKey, setSleepStartDateKey, sleepStartHour, setSleepStartHour, sleepStartMinute, setSleepStartMinute,
+    sleepEndDateKey, setSleepEndDateKey, sleepEndHour, setSleepEndHour, sleepEndMinute, setSleepEndMinute,
+    handleAddPastSleep, error,
+    sleepInsightText, sleepInsightLoading, sleepInsightError, sleepInsightGeneratedAt, refreshSleepInsight,
+    insightsEnabled, groqKeyDraft, setGroqKeyDraft, saveGroqApiKey,
+  } = props;
+
+  const sleepColor = isAsleep ? "#B39DFF" : (showWakeWarning ? (sleepStatusMins >= 120 ? "#E86A5C" : "#F2A65A") : "var(--text-primary)");
+  const sleepNightPct = 100 - sleepDayPct;
+
+  return h(
+    React.Fragment,
+    null,
+
+    /* Current status */
+    h(
+      "div",
+      { className: "bg-[var(--card-bg)] border border-[var(--card-border)] rounded-2xl px-5 py-5 mb-6" },
+      h("p", { className: "text-xs text-[var(--text-muted)] font-mono uppercase tracking-wide mb-2" }, isAsleep ? "Asleep for" : "Awake for"),
+      h(
+        "div",
+        { className: "flex items-baseline gap-2 flex-wrap" },
+        h("span", { className: "text-4xl", style: { fontFamily: "'Fraunces', Georgia, serif", fontWeight: 600, color: sleepColor } }, sleepStatusMins != null ? fmtDuration(sleepStatusMins) : "—"),
+        showWakeWarning &&
+          h("span", { className: "text-[10px] font-semibold px-2 py-1 rounded-full", style: { background: `${sleepColor}22`, color: sleepColor } }, "Nap soon?")
+      ),
+      h(
+        "p",
+        { className: "text-sm text-[var(--text-tertiary)] mt-2" },
+        isAsleep
+          ? `Since ${fmtTime(ongoingSleep.startTime)}`
+          : lastCompletedSleep
+          ? `Woke at ${fmtTime(lastCompletedSleep.endTime)}`
+          : "No sleep logged yet"
+      )
+    ),
+
+    /* AI Sleep Insight */
+    h(
+      "div",
+      { className: "bg-[var(--card-bg)] border border-[var(--card-border)] rounded-2xl px-4 py-2.5 mb-6" },
+      h(
+        "div",
+        { className: "flex items-center justify-between mb-1" },
+        h("p", { className: "text-[10px] text-[var(--text-muted)] font-mono uppercase tracking-wide" }, "AI sleep insight"),
+        insightsEnabled &&
+          h(
+            "button",
+            { onClick: () => refreshSleepInsight(true), className: "text-[var(--text-muted)] hover:text-[var(--text-primary)]", "aria-label": "Refresh sleep insight now" },
+            h("span", { className: sleepInsightLoading ? "inline-block animate-spin" : "inline-block" }, "⟳")
+          )
+      ),
+      h(
+        "div",
+        { className: "overflow-y-auto pr-1", style: { maxHeight: 56 } },
+        !insightsEnabled
+          ? h(GroqKeySetup, { groqKeyDraft, setGroqKeyDraft, saveGroqApiKey })
+          : sleepInsightLoading && !sleepInsightText
+          ? h("p", { className: "text-xs text-[var(--text-tertiary)]" }, "Thinking about sleep patterns…")
+          : sleepInsightText
+          ? h("p", { className: "text-xs text-[var(--text-secondary)] leading-relaxed" }, renderBoldText(sleepInsightText))
+          : h("p", { className: "text-xs text-[var(--text-tertiary)]" }, "Log a few sleep sessions and an insight will appear here.")
+      ),
+      sleepInsightGeneratedAt &&
+        h("p", { className: "text-[9px] text-[var(--text-muted)] mt-1" }, `Updated ${fmtTime(sleepInsightGeneratedAt)} on ${dayKey(new Date(sleepInsightGeneratedAt))}`),
+      sleepInsightError && h("p", { className: "text-[10px] text-[#E86A5C] mt-1" }, sleepInsightText ? `Last refresh failed: ${sleepInsightError}` : sleepInsightError)
+    ),
+
+    /* Today summary */
+    h(
+      "div",
+      { className: "grid grid-cols-3 gap-2 mb-6" },
+      h(SummaryCard, { label: "Total sleep", value: todaySleepTotalMins ? fmtDuration(todaySleepTotalMins) : "0m", unit: "", accent: "var(--text-primary)" }),
+      h(SummaryCard, { label: "Naps", value: `${todayNapCount}`, unit: "", accent: SLEEP_NAP_COLOR }),
+      h(SummaryCard, { label: "Longest", value: todayLongestStretchMins ? fmtDuration(todayLongestStretchMins) : "—", unit: "", accent: SLEEP_DURATION_COLOR })
+    ),
+
+    /* Log controls */
+    h(
+      "div",
+      { className: "bg-[var(--card-bg)] border border-[var(--card-border)] rounded-2xl p-4 mb-6" },
+      error && h("p", { className: "text-xs text-[#E86A5C] mb-3" }, error),
+      h(
+        "button",
+        {
+          onClick: toggleSleep,
+          disabled: sleepSubmitting,
+          className: "w-full rounded-xl py-3.5 font-semibold text-base shadow-lg active:scale-[0.98] transition-transform disabled:opacity-50",
+          style: isAsleep ? { background: "#F2C879", color: "#14162B" } : { background: "#6B5FCF", color: "#EDEEF7" },
+        },
+        sleepSubmitting ? "Saving…" : isAsleep ? "☀️ Wake up" : "🌙 Start sleep"
+      ),
+      h(
+        "button",
+        {
+          onClick: () => setLoggingPastSleep((v) => !v),
+          className: "text-xs text-center w-full mt-3 text-[#8FA8E0]",
+        },
+        loggingPastSleep ? "Cancel" : "Log a past sleep instead"
+      ),
+      loggingPastSleep &&
+        h(
+          "div",
+          { className: "mt-3 pt-3 border-t border-[var(--card-border)]" },
+          h(SleepTimePicker, {
+            label: "Start", dateKey: sleepStartDateKey, setDateKey: setSleepStartDateKey,
+            hour: sleepStartHour, setHour: setSleepStartHour, minute: sleepStartMinute, setMinute: setSleepStartMinute,
+          }),
+          h(SleepTimePicker, {
+            label: "End", dateKey: sleepEndDateKey, setDateKey: setSleepEndDateKey,
+            hour: sleepEndHour, setHour: setSleepEndHour, minute: sleepEndMinute, setMinute: setSleepEndMinute,
+          }),
+          h(
+            "button",
+            {
+              onClick: handleAddPastSleep,
+              disabled: sleepSubmitting,
+              className: "w-full bg-[#F2C879] text-[#14162B] rounded-xl py-3 font-semibold disabled:opacity-50",
+            },
+            "Add past sleep"
+          )
+        )
+    ),
+
+    /* Trend chart */
+    h(
+      "div",
+      { className: "mb-6" },
+      h("h2", { className: "text-sm font-mono uppercase tracking-wide text-[var(--text-muted)] mb-3" }, "Last 7 days"),
+      h(
+        "div",
+        { className: "bg-[var(--card-bg)] border border-[var(--card-border)] rounded-2xl p-3" },
+        h(StackedBarChart, {
+          data: sleepTrendData, height: 170, selectedIndex: selectedSleepTrendDay, onSelect: setSelectedSleepTrendDay,
+          keyA: "naps", keyB: "night", colorA: SLEEP_NAP_COLOR, colorB: SLEEP_NIGHT_COLOR,
+        }),
+        h(
+          "div",
+          { className: "flex gap-4 justify-center mt-2 text-xs text-[var(--text-tertiary)]" },
+          h("span", { className: "flex items-center gap-1.5" }, h("span", { className: "w-2.5 h-2.5 rounded-full inline-block", style: { background: SLEEP_NAP_COLOR } }), "Day naps"),
+          h("span", { className: "flex items-center gap-1.5" }, h("span", { className: "w-2.5 h-2.5 rounded-full inline-block", style: { background: SLEEP_NIGHT_COLOR } }), "Night sleep")
+        ),
+        selectedSleepTrendDay != null &&
+          sleepTrendData[selectedSleepTrendDay] &&
+          h(
+            "div",
+            { className: "mt-3 bg-[var(--bg)] border border-[var(--card-border)] rounded-xl px-3 py-2.5 flex items-center justify-between" },
+            h("span", { className: "text-sm text-[var(--text-secondary)] font-medium" }, sleepTrendData[selectedSleepTrendDay].fullLabel),
+            h(
+              "div",
+              { className: "flex gap-3 text-xs font-mono" },
+              h("span", { style: { color: SLEEP_NAP_COLOR } }, `${sleepTrendData[selectedSleepTrendDay].naps}h`),
+              h("span", { style: { color: SLEEP_NIGHT_COLOR } }, `${sleepTrendData[selectedSleepTrendDay].night}h`),
+              h("span", { className: "text-[var(--text-muted)]" }, `= ${Math.round((sleepTrendData[selectedSleepTrendDay].naps + sleepTrendData[selectedSleepTrendDay].night) * 10) / 10}h`)
+            )
+          )
+      )
+    ),
+
+    /* Sleep patterns */
+    h(
+      "div",
+      { className: "mb-6" },
+      h("h2", { className: "text-sm font-mono uppercase tracking-wide text-[var(--text-muted)] mb-3" }, "Sleep patterns"),
+
+      h(
+        "div",
+        { className: "grid grid-cols-2 gap-2 mb-3" },
+        h(
+          "div",
+          { className: "bg-[var(--card-bg)] border border-[var(--card-border)] rounded-2xl px-3 py-3 text-center" },
+          h("p", { className: "text-xs text-[var(--text-muted)] font-mono uppercase tracking-wide mb-1" }, "Naps / day"),
+          h("p", { className: "text-xl font-mono", style: { color: SLEEP_NAP_COLOR } }, avgNapsPerDay7 != null ? avgNapsPerDay7 : "—"),
+          h("p", { className: "text-[10px] text-[var(--text-muted)] mt-0.5" }, "last 7 days")
+        ),
+        h(
+          "div",
+          { className: "bg-[var(--card-bg)] border border-[var(--card-border)] rounded-2xl px-3 py-3 text-center" },
+          h("p", { className: "text-xs text-[var(--text-muted)] font-mono uppercase tracking-wide mb-1" }, "Avg nap length"),
+          h("p", { className: "text-xl font-mono", style: { color: SLEEP_NAP_COLOR } }, avgNapDurationMins7 != null ? fmtDuration(avgNapDurationMins7) : "—"),
+          h("p", { className: "text-[10px] text-[var(--text-muted)] mt-0.5" }, "last 7 days")
+        )
+      ),
+      h(
+        "div",
+        { className: "grid grid-cols-2 gap-2 mb-3" },
+        h(
+          "div",
+          { className: "bg-[var(--card-bg)] border border-[var(--card-border)] rounded-2xl px-3 py-3 text-center" },
+          h("p", { className: "text-xs text-[var(--text-muted)] font-mono uppercase tracking-wide mb-1" }, "Longest stretch"),
+          h("p", { className: "text-xl font-mono", style: { color: SLEEP_DURATION_COLOR } }, longestStretchMins7 != null ? fmtDuration(longestStretchMins7) : "—"),
+          h("p", { className: "text-[10px] text-[var(--text-muted)] mt-0.5" }, "last 7 days")
+        ),
+        h(
+          "div",
+          { className: "bg-[var(--card-bg)] border border-[var(--card-border)] rounded-2xl px-3 py-3 text-center" },
+          h("p", { className: "text-xs text-[var(--text-muted)] font-mono uppercase tracking-wide mb-1" }, "Avg wake window"),
+          h("p", { className: "text-xl font-mono", style: { color: SLEEP_DURATION_COLOR } }, avgWakeWindowMins7 != null ? fmtDuration(avgWakeWindowMins7) : "—"),
+          h("p", { className: "text-[10px] text-[var(--text-muted)] mt-0.5" }, "last 7 days")
+        )
+      ),
+
+      h(
+        "div",
+        { className: "bg-[var(--card-bg)] border border-[var(--card-border)] rounded-2xl p-4 mb-3" },
+        h("p", { className: "text-xs text-[var(--text-muted)] font-mono uppercase tracking-wide mb-3" }, "Day vs. night · last 7 days"),
+        sleepDayMins + sleepNightMins > 0
+          ? h(
+              React.Fragment,
+              null,
+              h(
+                "div",
+                { className: "flex h-2.5 rounded-full overflow-hidden mb-3" },
+                h("div", { style: { width: `${sleepDayPct}%`, background: "#F6C453" } }),
+                h("div", { style: { width: `${sleepNightPct}%`, background: "#5B6099" } })
+              ),
+              h(
+                "div",
+                { className: "flex justify-between text-sm" },
+                h("span", { className: "flex items-center gap-1.5" }, "☀️ ", fmtDuration(sleepDayMins), " ", h("span", { className: "text-[var(--text-muted)] font-mono text-xs" }, `(${sleepDayPct}%)`)),
+                h("span", { className: "flex items-center gap-1.5" }, "🌙 ", fmtDuration(sleepNightMins), " ", h("span", { className: "text-[var(--text-muted)] font-mono text-xs" }, `(${sleepNightPct}%)`))
+              ),
+              h("p", { className: "text-[10px] text-[var(--text-muted)] mt-2" }, "Day = 06:00–18:00, Night = 18:00–06:00")
+            )
+          : h("p", { className: "text-sm text-[var(--text-muted)]" }, "Not enough data yet.")
+      ),
+
+      h(
+        "div",
+        null,
+        h("p", { className: "text-xs text-[var(--text-muted)] font-mono uppercase tracking-wide mb-2 px-1" }, "When sleep starts · last 14 days"),
+        h(
+          "div",
+          { className: "bg-[var(--card-bg)] border border-[var(--card-border)] rounded-2xl p-3" },
+          h(FrequencyLineChart, { data: sleepBucketData, height: 100, currentIndex: currentBucketIndex })
+        )
+      ),
+
+      h(
+        "div",
+        { className: "mt-3" },
+        h("p", { className: "text-xs text-[var(--text-muted)] font-mono uppercase tracking-wide mb-2 px-1" }, "Avg duration by time · last 14 days"),
+        h(
+          "div",
+          { className: "bg-[var(--card-bg)] border border-[var(--card-border)] rounded-2xl p-3" },
+          h(AvgVolumeChart, { data: sleepBucketData, height: 110, currentIndex: currentBucketIndex, unit: "min", noun: "session", color: SLEEP_DURATION_COLOR })
+        )
+      )
+    ),
+
+    /* Sleep history */
+    h(
+      "div",
+      null,
+      h("h2", { className: "text-sm font-mono uppercase tracking-wide text-[var(--text-muted)] mb-3" }, "Sleep history"),
+      sleepHistoryKeys.length === 0 &&
+        h("p", { className: "text-sm text-[var(--text-muted)] bg-[var(--card-bg)] border border-[var(--card-border)] rounded-2xl p-4" },
+          "No sleep logged yet. Tap \"Start sleep\" above — it'll show up here for both of you."),
+      sleepHistoryKeys.slice(0, visibleSleepDayCount).map((key, idx) => {
+        const sessions = sleepHistoryByDay[key].slice().reverse();
+        const dayTotalMins = sleepHistoryByDay[key].reduce((sum, s) => {
+          const end = s.endTime ? new Date(s.endTime) : new Date();
+          return sum + (end - new Date(s.startTime)) / 60000;
+        }, 0);
+        const isExpanded = Object.prototype.hasOwnProperty.call(expandedSleepDays, key) ? expandedSleepDays[key] : idx === 0;
+        return h(
+          "div",
+          { key, className: "mb-2" },
+          h(
+            "button",
+            {
+              onClick: () => setExpandedSleepDays((prev) => ({ ...prev, [key]: !isExpanded })),
+              className: "w-full flex items-center justify-between mb-1.5 px-1 py-1",
+            },
+            h(
+              "span",
+              { className: "flex items-center gap-1.5" },
+              h("span", { className: "text-[var(--text-muted)] text-xs transition-transform inline-block", style: { transform: isExpanded ? "rotate(90deg)" : "rotate(0deg)" } }, "▶"),
+              h("span", { className: "text-sm font-medium" }, fmtDayLabel(key)),
+              h("span", { className: "text-xs text-[var(--text-muted)] font-mono" }, `(${sessions.length})`)
+            ),
+            h("span", { className: "text-xs text-[var(--text-muted)] font-mono" }, fmtDuration(dayTotalMins))
+          ),
+          isExpanded &&
+            h(
+              "div",
+              { className: "bg-[var(--card-bg)] border border-[var(--card-border)] rounded-2xl divide-y divide-[var(--card-border)]" },
+              sessions.map((s) => {
+                const mins = (s.endTime ? new Date(s.endTime) : new Date()) - new Date(s.startTime);
+                const durationMins = mins / 60000;
+                return h(
+                  "div",
+                  { key: s.id, className: "flex items-center gap-3 px-4 py-2.5" },
+                  h("span", { className: "w-2 h-2 rounded-full flex-shrink-0", style: { background: s.endTime ? SLEEP_NAP_COLOR : "#F2C879" } }),
+                  h(
+                    "div",
+                    { className: "flex-1 min-w-0" },
+                    h("p", { className: "text-sm font-mono" }, `${fmtTime(s.startTime)} – ${s.endTime ? fmtTime(s.endTime) : "now"}`),
+                    h("p", { className: "text-xs text-[var(--text-muted)]" }, s.endTime ? fmtDuration(durationMins) : "ongoing")
+                  ),
+                  confirmingDeleteSleepId === s.id
+                    ? h(
+                        "div",
+                        { className: "flex items-center gap-1.5 flex-shrink-0" },
+                        h("button", { onClick: () => handleDeleteSleep(s.id), className: "bg-[#E08A8A] text-[#14162B] text-xs font-semibold rounded-full px-2.5 py-1.5" }, "Delete?"),
+                        h("button", { onClick: () => setConfirmingDeleteSleepId(null), className: "bg-[var(--card-border)] text-[var(--text-tertiary)] rounded-full p-1.5" }, "✕")
+                      )
+                    : h(
+                        "button",
+                        {
+                          onClick: () => setConfirmingDeleteSleepId(s.id),
+                          className: "bg-[var(--card-border)] hover:bg-[#3A1F2E] text-[var(--text-tertiary)] hover:text-[#E08A8A] rounded-full p-2 transition-colors flex-shrink-0",
+                          "aria-label": "Delete session",
+                        },
+                        "✕"
+                      )
+                )
+              })
+            )
+        );
+      }),
+      sleepHistoryKeys.length > visibleSleepDayCount &&
+        h(
+          "button",
+          {
+            onClick: () => setVisibleSleepDayCount((v) => v + 7),
+            className: "w-full text-center text-xs font-mono text-[#8FA8E0] bg-[var(--card-bg)] border border-[var(--card-border)] rounded-xl py-2.5 mt-1",
+          },
+          `Show 7 more days (${sleepHistoryKeys.length - visibleSleepDayCount} more available)`
+        )
+    )
+  );
+}
+
+function App() {
+  const [entries, setEntries] = useState([]);
+  const [loaded, setLoaded] = useState(false);
+  const [syncing, setSyncing] = useState(false);
+  const [error, setError] = useState(null);
+
+  const [feedType, setFeedType] = useState("breast");
+  const [volumeMl, setVolumeMl] = useState(120);
+  const [useCustomTime, setUseCustomTime] = useState(false);
+  const [customDateKey, setCustomDateKey] = useState(dayKey(new Date()));
+  const [customHour, setCustomHour] = useState(tzParts(new Date()).hour);
+  const [customMinute, setCustomMinute] = useState(Math.floor(tzParts(new Date()).minute / 5) * 5);
+  const [submitting, setSubmitting] = useState(false);
+  const [now, setNow] = useState(new Date());
+  const [confirmingDeleteId, setConfirmingDeleteId] = useState(null);
+  const [selectedTrendDay, setSelectedTrendDay] = useState(6);
+  const [expandedDays, setExpandedDays] = useState({});
+  const [visibleDayCount, setVisibleDayCount] = useState(3);
+  const [isOnline, setIsOnline] = useState(typeof navigator !== "undefined" ? navigator.onLine : true);
+  const [pendingCount, setPendingCount] = useState(loadQueue().length);
+  const [insightText, setInsightText] = useState(null);
+  const [insightSlot, setInsightSlot] = useState(null);
+  const [insightLoading, setInsightLoading] = useState(false);
+  const [insightError, setInsightError] = useState(null);
+  const [insightGeneratedAt, setInsightGeneratedAt] = useState(null);
+  const [sleepInsightText, setSleepInsightText] = useState(null);
+  const [sleepInsightSlot, setSleepInsightSlot] = useState(null);
+  const [sleepInsightLoading, setSleepInsightLoading] = useState(false);
+  const [sleepInsightError, setSleepInsightError] = useState(null);
+  const [sleepInsightGeneratedAt, setSleepInsightGeneratedAt] = useState(null);
+  const [weightKg, setWeightKg] = useState(null);
+  const [groqApiKey, setGroqApiKey] = useState(null);
+  const [editingGroqKey, setEditingGroqKey] = useState(false);
+  const [groqKeyDraft, setGroqKeyDraft] = useState("");
+  const insightsEnabled = !!groqApiKey;
+  const [weightUpdatedAt, setWeightUpdatedAt] = useState(null);
+  const [editingWeight, setEditingWeight] = useState(false);
+  const [weightDraft, setWeightDraft] = useState("");
+  const [activeTab, setActiveTab] = useState("feeding");
+
+  const [sleepSessions, setSleepSessions] = useState([]);
+  const [sleepLoaded, setSleepLoaded] = useState(false);
+  const [confirmingDeleteSleepId, setConfirmingDeleteSleepId] = useState(null);
+  const [selectedSleepTrendDay, setSelectedSleepTrendDay] = useState(6);
+  const [expandedSleepDays, setExpandedSleepDays] = useState({});
+  const [visibleSleepDayCount, setVisibleSleepDayCount] = useState(3);
+  const [loggingPastSleep, setLoggingPastSleep] = useState(false);
+  const [sleepStartDateKey, setSleepStartDateKey] = useState(dayKey(new Date()));
+  const [sleepStartHour, setSleepStartHour] = useState(tzParts(new Date()).hour);
+  const [sleepStartMinute, setSleepStartMinute] = useState(Math.floor(tzParts(new Date()).minute / 5) * 5);
+  const [sleepEndDateKey, setSleepEndDateKey] = useState(dayKey(new Date()));
+  const [sleepEndHour, setSleepEndHour] = useState(tzParts(new Date()).hour);
+  const [sleepEndMinute, setSleepEndMinute] = useState(Math.floor(tzParts(new Date()).minute / 5) * 5);
+  const [sleepSubmitting, setSleepSubmitting] = useState(false);
+
+  const pollRef = useRef(null);
+
+  const loadEntries = useCallback(async (showSpinner) => {
+    if (showSpinner) setSyncing(true);
+    try {
+      const res = await safeFetch(await authedUrl("/entries.json"));
+      const data = await res.json();
+      const fetched = data ? Object.entries(data).map(([id, val]) => ({ id, ...val })) : [];
+      setEntries((prev) => mergeById(fetched, prev));
+      saveCache(CACHE_KEY, fetched);
+      setIsOnline(true);
+      setError(null);
+    } catch (e) {
+      if (e.isNetworkError) {
+        setIsOnline(false);
+        setEntries((prev) => (prev.length ? prev : loadCache(CACHE_KEY)));
+      } else {
+        setIsOnline(true); // we reached the server — it just rejected the request
+        setError(`Sync error: ${e.message}`);
+      }
+    } finally {
+      if (showSpinner) setSyncing(false);
+    }
+  }, []);
+
+  const loadSleepSessions = useCallback(async () => {
+    try {
+      const res = await safeFetch(await authedUrl("/sleepSessions.json"));
+      const data = await res.json();
+      const fetched = data ? Object.entries(data).map(([id, val]) => ({ id, ...val })) : [];
+      setSleepSessions((prev) => mergeById(fetched, prev));
+      saveCache(SLEEP_CACHE_KEY, fetched);
+      setIsOnline(true);
+    } catch (e) {
+      if (e.isNetworkError) {
+        setIsOnline(false);
+        setSleepSessions((prev) => (prev.length ? prev : loadCache(SLEEP_CACHE_KEY)));
+      } else {
+        setIsOnline(true);
+        setError(`Sleep sync error: ${e.message}`);
+      }
+    }
+  }, []);
+
+  const flushQueue = useCallback(async () => {
+    let queue = loadQueue();
+    if (!queue.length) return;
+    while (queue.length) {
+      const op = queue[0];
+      try {
+        if (op.type === "put") {
+          await safeFetch(await authedUrl(`/entries/${op.entry.id}.json`), {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ time: op.entry.time, type: op.entry.type, volumeMl: op.entry.volumeMl }),
+          });
+        } else if (op.type === "delete") {
+          await safeFetch(await authedUrl(`/entries/${op.id}.json`), { method: "DELETE" });
+        } else if (op.type === "weight") {
+          await safeFetch(await authedUrl("/babyProfile.json"), {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ weightKg: op.weightKg, updatedAt: op.updatedAt }),
+          });
+        } else if (op.type === "sleepPut") {
+          await safeFetch(await authedUrl(`/sleepSessions/${op.session.id}.json`), {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(
+              op.session.endTime ? { startTime: op.session.startTime, endTime: op.session.endTime } : { startTime: op.session.startTime }
+            ),
+          });
+        } else if (op.type === "sleepDelete") {
+          await safeFetch(await authedUrl(`/sleepSessions/${op.id}.json`), { method: "DELETE" });
+        }
+        queue = queue.slice(1);
+        saveQueue(queue);
+        setPendingCount(queue.length);
+        setIsOnline(true);
+      } catch (e) {
+        if (e.isNetworkError) {
+          setIsOnline(false);
+          break; // genuinely offline — stop and retry everything remaining next time
+        } else {
+          // request reached the server but was rejected (e.g. rules/validation) —
+          // drop this one op so it doesn't block the rest of the queue forever
+          setError(`Couldn't sync a queued change: ${e.message}`);
+          queue = queue.slice(1);
+          saveQueue(queue);
+          setPendingCount(queue.length);
+          setIsOnline(true);
+        }
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    (async () => {
+      await Promise.all([loadEntries(false), loadSleepSessions()]);
+      await flushQueue();
+      setLoaded(true);
+      setSleepLoaded(true);
+    })();
+    pollRef.current = setInterval(() => {
+      loadEntries(false);
+      loadSleepSessions();
+      flushQueue();
+    }, 15000);
+    const onFocus = () => { loadEntries(false); loadSleepSessions(); flushQueue(); };
+    const onOnline = () => { setIsOnline(true); loadEntries(false); loadSleepSessions(); flushQueue(); };
+    const onOffline = () => setIsOnline(false);
+    window.addEventListener("focus", onFocus);
+    window.addEventListener("online", onOnline);
+    window.addEventListener("offline", onOffline);
+    return () => {
+      clearInterval(pollRef.current);
+      window.removeEventListener("focus", onFocus);
+      window.removeEventListener("online", onOnline);
+      window.removeEventListener("offline", onOffline);
+    };
+  }, [loadEntries, loadSleepSessions, flushQueue]);
+
+  const entriesRef = useRef([]);
+  useEffect(() => { entriesRef.current = entries; }, [entries]);
+  const weightRef = useRef(null);
+  useEffect(() => { weightRef.current = weightKg; }, [weightKg]);
+  const groqApiKeyRef = useRef(null);
+  useEffect(() => { groqApiKeyRef.current = groqApiKey; }, [groqApiKey]);
+  const sleepSessionsRef = useRef([]);
+  useEffect(() => { sleepSessionsRef.current = sleepSessions; }, [sleepSessions]);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await fetch(await authedUrl("/babyProfile.json"));
+        const data = await res.json();
+        if (data && typeof data.weightKg === "number") {
+          setWeightKg(data.weightKg);
+          setWeightUpdatedAt(data.updatedAt || null);
+          try { localStorage.setItem("nightwatch_weight_cache", JSON.stringify(data)); } catch (e) {}
+        }
+      } catch (e) {
+        try {
+          const cached = JSON.parse(localStorage.getItem("nightwatch_weight_cache") || "null");
+          if (cached && typeof cached.weightKg === "number") {
+            setWeightKg(cached.weightKg);
+            setWeightUpdatedAt(cached.updatedAt || null);
+          }
+        } catch (e2) {}
+      }
+    })();
+  }, []);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await fetch(await authedUrl("/appConfig.json"));
+        const data = await res.json();
+        if (data && typeof data.groqApiKey === "string" && data.groqApiKey) {
+          setGroqApiKey(data.groqApiKey);
+          try { localStorage.setItem("nightwatch_groqkey_cache", data.groqApiKey); } catch (e) {}
+        }
+      } catch (e) {
+        try {
+          const cached = localStorage.getItem("nightwatch_groqkey_cache");
+          if (cached) setGroqApiKey(cached);
+        } catch (e2) {}
+      }
+    })();
+  }, []);
+
+  async function saveGroqApiKey() {
+    const trimmed = groqKeyDraft.trim();
+    if (!trimmed) {
+      setEditingGroqKey(false);
+      return;
+    }
+    setGroqApiKey(trimmed);
+    setEditingGroqKey(false);
+    try { localStorage.setItem("nightwatch_groqkey_cache", trimmed); } catch (e) {}
+    try {
+      await safeFetch(await authedUrl("/appConfig.json"), {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ groqApiKey: trimmed }),
+      });
+    } catch (e) {
+      setError("Key saved on this phone, but couldn't sync to your partner's — check your connection.");
+    }
+  }
+
+  async function saveWeight() {
+    const val = parseFloat(weightDraft);
+    if (!val || val <= 0) {
+      setEditingWeight(false);
+      return;
+    }
+    const rounded = Math.round(val * 100) / 100;
+    const updatedAt = new Date().toISOString();
+    setWeightKg(rounded);
+    setWeightUpdatedAt(updatedAt);
+    setEditingWeight(false);
+    try { localStorage.setItem("nightwatch_weight_cache", JSON.stringify({ weightKg: rounded, updatedAt })); } catch (e) {}
+    try {
+      await safeFetch(await authedUrl("/babyProfile.json"), {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ weightKg: rounded, updatedAt }),
+      });
+      setIsOnline(true);
+    } catch (e) {
+      if (e.isNetworkError) {
+        const queue = loadQueue();
+        queue.push({ type: "weight", weightKg: rounded, updatedAt });
+        saveQueue(queue);
+        setPendingCount(queue.length);
+        setIsOnline(false);
+        setError("Weight saved on this phone — will sync once you're back online.");
+      } else {
+        setIsOnline(true);
+        setError(`Couldn't save weight: ${e.message}`);
+      }
+    }
+  }
+
+  const refreshInsight = useCallback(async (force = false) => {
+    if (!isOnline) return;
+    const currentEntries = entriesRef.current;
+    try {
+      const res = await safeFetch(await authedUrl("/insights/latest.json"));
+      const data = await res.json();
+      const currentSlot = computeInsightSlot(new Date());
+      if (data && data.text) {
+        setInsightText(data.text);
+        setInsightSlot(data.slotId || null);
+        setInsightGeneratedAt(data.generatedAt || null);
+      }
+      const needsRegen = groqApiKeyRef.current && currentEntries.length >= 3 && (force || data?.slotId !== currentSlot);
+      if (needsRegen) {
+        setInsightLoading(true);
+        const summary = buildInsightSummary(currentEntries, new Date(), weightRef.current);
+        const text = await generateInsightText(summary, FEEDING_SYSTEM_PROMPT, groqApiKeyRef.current);
+        const generatedAt = new Date().toISOString();
+        await safeFetch(await authedUrl("/insights/latest.json"), {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text, slotId: currentSlot, generatedAt }),
+        });
+        setInsightText(text);
+        setInsightSlot(currentSlot);
+        setInsightGeneratedAt(generatedAt);
+        setInsightError(null);
+      }
+    } catch (e) {
+      setInsightError(e.message || "Couldn't refresh the AI insight right now.");
+    } finally {
+      setInsightLoading(false);
+    }
+  }, [isOnline]);
+
+  const refreshSleepInsight = useCallback(async (force = false) => {
+    if (!isOnline) return;
+    const currentSleep = sleepSessionsRef.current;
+    try {
+      const res = await safeFetch(await authedUrl("/insights/sleepLatest.json"));
+      const data = await res.json();
+      const currentSlot = computeInsightSlot(new Date());
+      if (data && data.text) {
+        setSleepInsightText(data.text);
+        setSleepInsightSlot(data.slotId || null);
+        setSleepInsightGeneratedAt(data.generatedAt || null);
+      }
+      const completedCount = currentSleep.filter((s) => s.endTime).length;
+      const needsRegen = groqApiKeyRef.current && completedCount >= 3 && (force || data?.slotId !== currentSlot);
+      if (needsRegen) {
+        setSleepInsightLoading(true);
+        const summary = buildSleepInsightSummary(currentSleep, new Date(), weightRef.current);
+        const text = await generateInsightText(summary, SLEEP_SYSTEM_PROMPT, groqApiKeyRef.current);
+        const generatedAt = new Date().toISOString();
+        await safeFetch(await authedUrl("/insights/sleepLatest.json"), {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text, slotId: currentSlot, generatedAt }),
+        });
+        setSleepInsightText(text);
+        setSleepInsightSlot(currentSlot);
+        setSleepInsightGeneratedAt(generatedAt);
+        setSleepInsightError(null);
+      }
+    } catch (e) {
+      setSleepInsightError(e.message || "Couldn't refresh the AI sleep insight right now.");
+    } finally {
+      setSleepInsightLoading(false);
+    }
+  }, [isOnline]);
+
+  useEffect(() => {
+    if (!loaded) return;
+    refreshInsight();
+    refreshSleepInsight();
+    const t = setInterval(() => { refreshInsight(); refreshSleepInsight(); }, 5 * 60 * 1000);
+    return () => clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loaded]);
+
+  useEffect(() => {
+    const t = setInterval(() => setNow(new Date()), 30000);
+    return () => clearInterval(t);
+  }, []);
+
+  const isDayTheme = hourInTZ(now) >= 6 && hourInTZ(now) < 18;
+  useEffect(() => {
+    document.documentElement.setAttribute("data-theme", isDayTheme ? "light" : "dark");
+  }, [isDayTheme]);
+
+  async function handleAddEntry() {
+    const vol = volumeMl;
+    if (!vol || vol <= 0) {
+      setError("Enter a volume greater than zero.");
+      return;
+    }
+    setSubmitting(true);
+    setError(null);
+    const time = useCustomTime ? tzWallTimeToISO(customDateKey, customHour, customMinute) : new Date().toISOString();
+    const entry = { id: uid(), time, type: feedType, volumeMl: Math.round(vol) };
+    const next = [...entries, entry].sort((a, b) => new Date(a.time) - new Date(b.time));
+    setEntries(next);
+    setUseCustomTime(false);
+    const nowParts = tzParts(new Date());
+    setCustomDateKey(dayKey(new Date()));
+    setCustomHour(nowParts.hour);
+    setCustomMinute(Math.floor(nowParts.minute / 5) * 5);
+    try {
+      await safeFetch(await authedUrl(`/entries/${entry.id}.json`), {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ time: entry.time, type: entry.type, volumeMl: entry.volumeMl }),
+      });
+      setIsOnline(true);
+    } catch (e) {
+      if (e.isNetworkError) {
+        const queue = loadQueue();
+        queue.push({ type: "put", entry: { id: entry.id, time: entry.time, type: entry.type, volumeMl: entry.volumeMl } });
+        saveQueue(queue);
+        setPendingCount(queue.length);
+        setIsOnline(false);
+        setError("Saved on this phone — will sync once you're back online.");
+      } else {
+        setIsOnline(true);
+        setError(`Couldn't save: ${e.message}`);
+      }
+    }
+    setSubmitting(false);
+  }
+
+  async function handleDelete(id) {
+    const next = entries.filter((e) => e.id !== id);
+    setEntries(next);
+    setConfirmingDeleteId(null);
+    try {
+      await safeFetch(await authedUrl(`/entries/${id}.json`), { method: "DELETE" });
+      setIsOnline(true);
+    } catch (e) {
+      if (e.isNetworkError) {
+        const queue = loadQueue();
+        queue.push({ type: "delete", id });
+        saveQueue(queue);
+        setPendingCount(queue.length);
+        setIsOnline(false);
+        setError("Delete saved on this phone — will sync once you're back online.");
+      } else {
+        setIsOnline(true);
+        setError(`Couldn't delete: ${e.message}`);
+      }
+    }
+  }
+
+  async function toggleSleep() {
+    setSleepSubmitting(true);
+    setError(null);
+    const ongoing = sleepSessions.find((s) => !s.endTime);
+    if (ongoing) {
+      const endTime = new Date().toISOString();
+      const updated = { ...ongoing, endTime };
+      setSleepSessions(sleepSessions.map((s) => (s.id === ongoing.id ? updated : s)));
+      try {
+        await safeFetch(await authedUrl(`/sleepSessions/${ongoing.id}.json`), {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ startTime: ongoing.startTime, endTime }),
+        });
+        setIsOnline(true);
+      } catch (e) {
+        if (e.isNetworkError) {
+          const queue = loadQueue();
+          queue.push({ type: "sleepPut", session: updated });
+          saveQueue(queue);
+          setPendingCount(queue.length);
+          setIsOnline(false);
+          setError("Wake-up saved on this phone — will sync once you're back online.");
+        } else {
+          setIsOnline(true);
+          setError(`Couldn't save: ${e.message}`);
+        }
+      }
+    } else {
+      const session = { id: uid(), startTime: new Date().toISOString() };
+      setSleepSessions([...sleepSessions, session]);
+      try {
+        await safeFetch(await authedUrl(`/sleepSessions/${session.id}.json`), {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ startTime: session.startTime }),
+        });
+        setIsOnline(true);
+      } catch (e) {
+        if (e.isNetworkError) {
+          const queue = loadQueue();
+          queue.push({ type: "sleepPut", session });
+          saveQueue(queue);
+          setPendingCount(queue.length);
+          setIsOnline(false);
+          setError("Sleep start saved on this phone — will sync once you're back online.");
+        } else {
+          setIsOnline(true);
+          setError(`Couldn't save: ${e.message}`);
+        }
+      }
+    }
+    setSleepSubmitting(false);
+  }
+
+  async function handleAddPastSleep() {
+    const startISO = tzWallTimeToISO(sleepStartDateKey, sleepStartHour, sleepStartMinute);
+    const endISO = tzWallTimeToISO(sleepEndDateKey, sleepEndHour, sleepEndMinute);
+    if (new Date(endISO) <= new Date(startISO)) {
+      setError("End time must be after start time.");
+      return;
+    }
+    setSleepSubmitting(true);
+    setError(null);
+    const session = { id: uid(), startTime: startISO, endTime: endISO };
+    setSleepSessions([...sleepSessions, session]);
+    setLoggingPastSleep(false);
+    try {
+      await safeFetch(await authedUrl(`/sleepSessions/${session.id}.json`), {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ startTime: session.startTime, endTime: session.endTime }),
+      });
+      setIsOnline(true);
+    } catch (e) {
+      if (e.isNetworkError) {
+        const queue = loadQueue();
+        queue.push({ type: "sleepPut", session });
+        saveQueue(queue);
+        setPendingCount(queue.length);
+        setIsOnline(false);
+        setError("Saved on this phone — will sync once you're back online.");
+      } else {
+        setIsOnline(true);
+        setError(`Couldn't save: ${e.message}`);
+      }
+    }
+    setSleepSubmitting(false);
+  }
+
+  async function handleDeleteSleep(id) {
+    const next = sleepSessions.filter((s) => s.id !== id);
+    setSleepSessions(next);
+    setConfirmingDeleteSleepId(null);
+    try {
+      await safeFetch(await authedUrl(`/sleepSessions/${id}.json`), { method: "DELETE" });
+      setIsOnline(true);
+    } catch (e) {
+      if (e.isNetworkError) {
+        const queue = loadQueue();
+        queue.push({ type: "sleepDelete", id });
+        saveQueue(queue);
+        setPendingCount(queue.length);
+        setIsOnline(false);
+        setError("Delete saved on this phone — will sync once you're back online.");
+      } else {
+        setIsOnline(true);
+        setError(`Couldn't delete: ${e.message}`);
+      }
+    }
+  }
+
+  const sorted = [...entries].sort((a, b) => new Date(a.time) - new Date(b.time));
+  const todayKeyNow = dayKey(now);
+  const todayEntries = sorted.filter((e) => dayKey(new Date(e.time)) === todayKeyNow);
+  const lastEntry = sorted[sorted.length - 1];
+  const minutesSinceLast = lastEntry ? (now - new Date(lastEntry.time)) / 60000 : null;
+  let feedColor = "var(--text-primary)";
+  let showFeedWarning = false;
+  if (minutesSinceLast != null && minutesSinceLast >= 150) {
+    showFeedWarning = true;
+    feedColor = minutesSinceLast >= 180 ? "#E86A5C" : "#F2A65A";
+  }
+
+  const todayTotalMl = todayEntries.reduce((s, e) => s + e.volumeMl, 0);
+  const todayBreastMl = todayEntries.filter((e) => e.type === "breast").reduce((s, e) => s + e.volumeMl, 0);
+  const todayFormulaMl = todayEntries.filter((e) => e.type === "formula").reduce((s, e) => s + e.volumeMl, 0);
+
+  const trendDayKeys = [];
+  for (let i = 6; i >= 0; i--) trendDayKeys.push(shiftDayKey(todayKeyNow, -i));
+  const trendData = trendDayKeys.map((key) => {
+    const dayEntries = sorted.filter((e) => dayKey(new Date(e.time)) === key);
+    return {
+      label: new Date(keyToUTCms(key)).toLocaleDateString([], { weekday: "short", timeZone: "UTC" }),
+      fullLabel: fmtDayLabel(key),
+      breast: dayEntries.filter((e) => e.type === "breast").reduce((s, e) => s + e.volumeMl, 0),
+      formula: dayEntries.filter((e) => e.type === "formula").reduce((s, e) => s + e.volumeMl, 0),
+    };
+  });
+
+  const last7Cutoff = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+  const last14Cutoff = new Date(now.getTime() - 14 * 24 * 60 * 60 * 1000);
+  const last7Entries = sorted.filter((e) => new Date(e.time) >= last7Cutoff);
+  const last14Entries = sorted.filter((e) => new Date(e.time) >= last14Cutoff);
+
+  const avgVolume7 = last7Entries.length ? Math.round(last7Entries.reduce((s, e) => s + e.volumeMl, 0) / last7Entries.length) : null;
+  const intervalGaps7 = [];
+  for (let i = 1; i < last7Entries.length; i++) {
+    intervalGaps7.push((new Date(last7Entries[i].time) - new Date(last7Entries[i - 1].time)) / 60000);
+  }
+  const avgIntervalMins7 = intervalGaps7.length ? intervalGaps7.reduce((a, b) => a + b, 0) / intervalGaps7.length : null;
+
+  let dayMl = 0, nightMl = 0;
+  last7Entries.forEach((e) => {
+    const hh = hourInTZ(e.time);
+    if (hh >= 6 && hh < 18) dayMl += e.volumeMl;
+    else nightMl += e.volumeMl;
+  });
+  const splitTotalMl = dayMl + nightMl;
+  const dayPct = splitTotalMl ? Math.round((dayMl / splitTotalMl) * 100) : 0;
+  const nightPct = splitTotalMl ? 100 - dayPct : 0;
+
+  const volumeBuckets = Array.from({ length: 8 }, (_, i) => ({ hourStart: i * 3, totalMl: 0, count: 0 }));
+  last14Entries.forEach((e) => {
+    const hh = hourInTZ(e.time);
+    const idx = Math.floor(hh / 3);
+    volumeBuckets[idx].totalMl += e.volumeMl;
+    volumeBuckets[idx].count += 1;
+  });
+  const totalLast14 = last14Entries.length;
+  const avgVolumeByTimeData = volumeBuckets.map((b) => ({
+    label: `${b.hourStart}-${b.hourStart + 3}`,
+    value: b.count ? Math.round(b.totalMl / b.count) : 0,
+    count: b.count,
+    pct: totalLast14 ? Math.round((b.count / totalLast14) * 100) : 0,
+  }));
+  const currentBucketIndex = Math.floor(hourInTZ(now) / 3);
+
+  const historyByDay = {};
+  sorted.forEach((e, idx) => {
+    const key = dayKey(new Date(e.time));
+    if (!historyByDay[key]) historyByDay[key] = [];
+    const prev = sorted[idx - 1];
+    const gapMins = prev ? (new Date(e.time) - new Date(prev.time)) / 60000 : null;
+    historyByDay[key].push({ ...e, gapMins });
+  });
+  const historyKeys = Object.keys(historyByDay).sort((a, b) => (a < b ? 1 : -1));
+
+  /* ---------- SLEEP ANALYTICS ---------- */
+  const sortedSleep = [...sleepSessions].sort((a, b) => new Date(a.startTime) - new Date(b.startTime));
+  const ongoingSleep = sortedSleep.find((s) => !s.endTime);
+  const completedSleep = sortedSleep.filter((s) => s.endTime);
+  const lastCompletedSleep = completedSleep[completedSleep.length - 1];
+  function sleepDurationMins(s) {
+    const end = s.endTime ? new Date(s.endTime) : now;
+    return (end - new Date(s.startTime)) / 60000;
+  }
+  const isAsleep = !!ongoingSleep;
+  const sleepStatusMins = isAsleep
+    ? sleepDurationMins(ongoingSleep)
+    : lastCompletedSleep
+    ? (now - new Date(lastCompletedSleep.endTime)) / 60000
+    : null;
+  let sleepStatusColor = "var(--text-primary)";
+  let showWakeWarning = false;
+  if (!isAsleep && sleepStatusMins != null && sleepStatusMins >= 90) {
+    showWakeWarning = true;
+    sleepStatusColor = sleepStatusMins >= 120 ? "#E86A5C" : "#F2A65A";
+  }
+
+  const todaySleepAll = sortedSleep.filter((s) => dayKey(new Date(s.startTime)) === todayKeyNow);
+  const todaySleepTotalMins = todaySleepAll.reduce((sum, s) => sum + sleepDurationMins(s), 0);
+  const todayNapCount = todaySleepAll.length;
+  const todayLongestStretchMins = todaySleepAll.length ? Math.max(...todaySleepAll.map(sleepDurationMins)) : 0;
+
+  const sleepTrendData = trendDayKeys.map((key) => {
+    const daySessions = completedSleep.filter((s) => dayKey(new Date(s.startTime)) === key);
+    const dayMins = daySessions.filter((s) => { const hh = hourInTZ(s.startTime); return hh >= 6 && hh < 18; }).reduce((sum, s) => sum + sleepDurationMins(s), 0);
+    const nightMins = daySessions.filter((s) => { const hh = hourInTZ(s.startTime); return !(hh >= 6 && hh < 18); }).reduce((sum, s) => sum + sleepDurationMins(s), 0);
+    return {
+      label: new Date(keyToUTCms(key)).toLocaleDateString([], { weekday: "short", timeZone: "UTC" }),
+      fullLabel: fmtDayLabel(key),
+      naps: Math.round((dayMins / 60) * 10) / 10,
+      night: Math.round((nightMins / 60) * 10) / 10,
+    };
+  });
+
+  const last7Sleep = completedSleep.filter((s) => new Date(s.startTime) >= last7Cutoff);
+  const avgNapsPerDay7 = last7Sleep.length ? Math.round((last7Sleep.length / 7) * 10) / 10 : null;
+  const avgNapDurationMins7 = last7Sleep.length ? Math.round(last7Sleep.reduce((sum, s) => sum + sleepDurationMins(s), 0) / last7Sleep.length) : null;
+  const longestStretchMins7 = last7Sleep.length ? Math.max(...last7Sleep.map(sleepDurationMins)) : null;
+
+  const wakeGaps7 = [];
+  for (let i = 1; i < completedSleep.length; i++) {
+    const prev = completedSleep[i - 1];
+    const curr = completedSleep[i];
+    if (new Date(curr.startTime) >= last7Cutoff) {
+      wakeGaps7.push((new Date(curr.startTime) - new Date(prev.endTime)) / 60000);
+    }
+  }
+  const avgWakeWindowMins7 = wakeGaps7.length ? Math.round(wakeGaps7.reduce((a, b) => a + b, 0) / wakeGaps7.length) : null;
+
+  let sleepDayMins = 0, sleepNightMins = 0;
+  last7Sleep.forEach((s) => {
+    const hh = hourInTZ(s.startTime);
+    const mins = sleepDurationMins(s);
+    if (hh >= 6 && hh < 18) sleepDayMins += mins;
+    else sleepNightMins += mins;
+  });
+  const sleepSplitTotal = sleepDayMins + sleepNightMins;
+  const sleepDayPct = sleepSplitTotal ? Math.round((sleepDayMins / sleepSplitTotal) * 100) : 0;
+
+  const last14Sleep = completedSleep.filter((s) => new Date(s.startTime) >= last14Cutoff);
+  const sleepBuckets = Array.from({ length: 8 }, (_, i) => ({ hourStart: i * 3, totalMins: 0, count: 0 }));
+  last14Sleep.forEach((s) => {
+    const idx = Math.floor(hourInTZ(s.startTime) / 3);
+    sleepBuckets[idx].totalMins += sleepDurationMins(s);
+    sleepBuckets[idx].count += 1;
+  });
+  const totalLast14Sleep = last14Sleep.length;
+  const sleepBucketData = sleepBuckets.map((b) => ({
+    label: `${b.hourStart}-${b.hourStart + 3}`,
+    value: b.count ? Math.round(b.totalMins / b.count) : 0,
+    count: b.count,
+    pct: totalLast14Sleep ? Math.round((b.count / totalLast14Sleep) * 100) : 0,
+  }));
+
+  const sleepHistoryByDay = {};
+  sortedSleep.forEach((s) => {
+    const key = dayKey(new Date(s.startTime));
+    if (!sleepHistoryByDay[key]) sleepHistoryByDay[key] = [];
+    sleepHistoryByDay[key].push(s);
+  });
+  const sleepHistoryKeys = Object.keys(sleepHistoryByDay).sort((a, b) => (a < b ? 1 : -1));
+
+  function handleExport() {
+    const data = JSON.stringify(sorted, null, 2);
+    const blob = new Blob([data], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `nightwatch-backup-${dayKey(new Date())}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
+  if (!loaded) {
+    return h("div", { className: "min-h-screen bg-[var(--bg)] flex items-center justify-center" },
+      h("div", { className: "text-[var(--text-tertiary)] font-mono text-sm tracking-wide" }, "loading nightwatch…"));
+  }
+
+  return h(
+    "div",
+    { className: "min-h-screen bg-[var(--bg)] text-[var(--text-primary)]" },
+    h(
+      "div",
+      { className: "max-w-md mx-auto px-4 pb-16" },
+
+      /* Header */
+      h(
+        "div",
+        { className: "pt-8 pb-4 flex items-start justify-between" },
+        h(
+          "div",
+          null,
+          h("h1", { className: "text-3xl leading-none", style: { fontFamily: "'Fraunces', Georgia, serif", fontWeight: 600 } }, "Nightwatch"),
+          h("p", { className: "text-[var(--text-tertiary)] text-sm mt-1 font-mono" }, now.toLocaleDateString([], { weekday: "long", month: "long", day: "numeric", timeZone: APP_TIMEZONE })),
+          h("p", { className: "text-[9px] text-[var(--text-muted)] mt-0.5 font-mono" }, `build ${APP_VERSION}`),
+          (!isOnline || pendingCount > 0) &&
+            h(
+              "p",
+              { className: "text-[11px] font-mono mt-1 flex items-center gap-1.5", style: { color: "#F2A65A" } },
+              h("span", { className: "w-1.5 h-1.5 rounded-full inline-block", style: { background: "#F2A65A" } }),
+              !isOnline ? "Offline" : "Syncing…",
+              pendingCount > 0 && ` · ${pendingCount} pending`
+            )
+        ),
+        h(
+          "div",
+          { className: "flex gap-2" },
+          h(IconBtn, { onClick: handleExport, className: "mt-1 p-2.5", label: "Export backup" }, "⬇"),
+          h(IconBtn, { onClick: () => loadEntries(true), className: "mt-1 p-2.5", label: "Sync now" },
+            h("span", { className: syncing ? "inline-block animate-spin" : "inline-block" }, "⟳"))
+        )
+      ),
+
+      /* Baby age & weight — shared across tabs */
+      h(
+        "div",
+        { className: "flex items-center justify-between mb-4 px-1" },
+        h("span", { className: "text-xs font-mono text-[var(--text-muted)]" }, babyAgeShort(now)),
+        editingWeight
+          ? h(
+              "div",
+              { className: "flex items-center gap-1" },
+              h("input", {
+                autoFocus: true,
+                value: weightDraft,
+                onChange: (e) => setWeightDraft(e.target.value),
+                onKeyDown: (e) => e.key === "Enter" && saveWeight(),
+                type: "number",
+                inputMode: "decimal",
+                placeholder: "kg",
+                className: "w-14 bg-[var(--surface-2)] border border-[var(--surface-2-border)] rounded-full px-2 py-0.5 text-xs outline-none focus:border-[#8FA8E0] font-mono",
+              }),
+              h("button", { onClick: saveWeight, className: "text-[var(--gold-text)] text-xs font-bold px-1", "aria-label": "Save weight" }, "✓")
+            )
+          : h(
+              "button",
+              {
+                onClick: () => { setWeightDraft(weightKg != null ? String(weightKg) : ""); setEditingWeight(true); },
+                className: "text-xs font-mono text-[var(--text-muted)] hover:text-[var(--text-secondary)]",
+                title: weightUpdatedAt ? `Last updated ${fmtTime(weightUpdatedAt)} on ${dayKey(new Date(weightUpdatedAt))} — stays until you change it` : undefined,
+              },
+              weightKg != null ? `⚖ ${weightKg} kg ✎` : "⚖ add weight"
+            )
+      ),
+
+      /* Tab toggle */
+      h(
+        "div",
+        { className: "flex gap-2 mb-6 bg-[var(--card-bg)] border border-[var(--card-border)] rounded-full p-1" },
+        h(
+          "button",
+          {
+            onClick: () => setActiveTab("feeding"),
+            className: "flex-1 py-2 rounded-full text-sm font-medium transition-colors " +
+              (activeTab === "feeding" ? "bg-[var(--pill-bg)] text-[var(--pill-text)]" : "text-[var(--text-muted)]"),
+          },
+          "🍼 Feeding"
+        ),
+        h(
+          "button",
+          {
+            onClick: () => setActiveTab("sleep"),
+            className: "flex-1 py-2 rounded-full text-sm font-medium transition-colors " +
+              (activeTab === "sleep" ? "bg-[var(--pill-bg)] text-[var(--pill-text)]" : "text-[var(--text-muted)]"),
+          },
+          "🌙 Sleep"
+        )
+      ),
+
+      activeTab === "feeding" && h(
+        React.Fragment,
+        null,
+
+      /* Since last feed */
+      h(
+        "div",
+        { className: "bg-[var(--card-bg)] border border-[var(--card-border)] rounded-2xl px-5 py-5 mb-6" },
+        h("p", { className: "text-xs text-[var(--text-muted)] font-mono uppercase tracking-wide mb-2" }, "Since last feed"),
+        h(
+          "div",
+          { className: "flex items-baseline gap-2 flex-wrap" },
+          h("span", { className: "text-4xl", style: { fontFamily: "'Fraunces', Georgia, serif", fontWeight: 600, color: feedColor } }, minutesSinceLast != null ? fmtDuration(minutesSinceLast) : "—"),
+          showFeedWarning &&
+            h(
+              "span",
+              { className: "text-[10px] font-semibold px-2 py-1 rounded-full", style: { background: `${feedColor}22`, color: feedColor } },
+              "Feed now"
+            )
+        ),
+        lastEntry
+          ? h(
+              "div",
+              { className: "flex items-center gap-1.5 mt-2 text-sm text-[var(--text-tertiary)]" },
+              h("span", { className: "inline-block w-2 h-2 rounded-full flex-shrink-0", style: { background: lastEntry.type === "breast" ? BREAST_COLOR : FORMULA_COLOR } }),
+              h("span", { className: "font-mono" }, fmtTime(lastEntry.time)),
+              h("span", null, "·"),
+              h("span", null, lastEntry.type === "breast" ? "Breast milk" : "Formula"),
+              h("span", null, "·"),
+              h("span", { className: "font-mono" }, `${lastEntry.volumeMl} ml`)
+            )
+          : h("p", { className: "text-sm text-[var(--text-tertiary)] mt-2" }, "No feeds logged yet")
+      ),
+
+      /* AI Feeding Insight */
+      h(
+        "div",
+        { className: "bg-[var(--card-bg)] border border-[var(--card-border)] rounded-2xl px-4 py-2.5 mb-6" },
+        h(
+          "div",
+          { className: "flex items-center justify-between mb-1" },
+          h("p", { className: "text-[10px] text-[var(--text-muted)] font-mono uppercase tracking-wide" }, "AI feeding insight"),
+          insightsEnabled &&
+            h(
+              "button",
+              { onClick: () => refreshInsight(true), className: "text-[var(--text-muted)] hover:text-[var(--text-primary)]", "aria-label": "Refresh insight now" },
+              h("span", { className: insightLoading ? "inline-block animate-spin" : "inline-block" }, "⟳")
+            )
+        ),
+        h(
+          "div",
+          { className: "overflow-y-auto pr-1", style: { maxHeight: 56 } },
+          !insightsEnabled
+            ? h(GroqKeySetup, { groqKeyDraft, setGroqKeyDraft, saveGroqApiKey })
+            : insightLoading && !insightText
+            ? h("p", { className: "text-xs text-[var(--text-tertiary)]" }, "Thinking about the patterns…")
+            : insightText
+            ? h("p", { className: "text-xs text-[var(--text-secondary)] leading-relaxed" }, renderBoldText(insightText))
+            : h("p", { className: "text-xs text-[var(--text-tertiary)]" }, "Log a few more feeds and an insight will appear here.")
+        ),
+        insightGeneratedAt &&
+          h("p", { className: "text-[9px] text-[var(--text-muted)] mt-1" }, `Updated ${fmtTime(insightGeneratedAt)} on ${dayKey(new Date(insightGeneratedAt))}`),
+        insightError && h("p", { className: "text-[10px] text-[#E86A5C] mt-1" }, insightText ? `Last refresh failed: ${insightError}` : insightError)
+      ),
+
+      /* Today summary */
+      h(
+        "div",
+        { className: "grid grid-cols-3 gap-2 mb-6" },
+        h(SummaryCard, { label: "Today", value: `${todayTotalMl}`, unit: "ml", accent: "var(--text-primary)" }),
+        h(SummaryCard, { label: "Breast", value: `${todayBreastMl}`, unit: "ml", accent: BREAST_COLOR }),
+        h(SummaryCard, { label: "Formula", value: `${todayFormulaMl}`, unit: "ml", accent: FORMULA_COLOR })
+      ),
+
+      /* Log form */
+      h(
+        "div",
+        { className: "bg-[var(--card-bg)] border border-[var(--card-border)] rounded-2xl p-4 mb-6" },
+        h(
+          "div",
+          { className: "flex gap-2 mb-4" },
+          h(TypeButton, { active: feedType === "breast", color: BREAST_COLOR, emoji: "💧", label: "Breast milk", onClick: () => setFeedType("breast") }),
+          h(TypeButton, { active: feedType === "formula", color: FORMULA_COLOR, emoji: "🍼", label: "Formula", onClick: () => setFeedType("formula") })
+        ),
+
+        h("p", { className: "text-xs text-[var(--text-muted)] mb-2 font-mono uppercase tracking-wide text-center" }, "Volume"),
+        h(VolumeWheel, { value: volumeMl, onChange: setVolumeMl }),
+        h("p", { className: "text-xs text-[var(--text-muted)] mt-1.5 mb-3 font-mono text-center" }, `≈ ${(volumeMl / ML_PER_OZ).toFixed(1)} oz`),
+
+        h("p", { className: "text-xs text-[var(--text-muted)] mb-2 font-mono uppercase tracking-wide" }, "When"),
+        h(
+          "div",
+          { className: "flex gap-2 mb-3" },
+          h(
+            "button",
+            {
+              onClick: () => setUseCustomTime(false),
+              className: "flex-1 py-2 rounded-xl text-sm border transition-colors " +
+                (!useCustomTime ? "bg-[var(--pill-bg)] text-[var(--pill-text)] border-[var(--pill-bg)]" : "bg-[var(--surface-2)] border-[var(--surface-2-border)] text-[var(--text-secondary)] hover:border-[var(--surface-2-border-hover)]"),
+            },
+            "Log now"
+          ),
+          h(
+            "button",
+            {
+              onClick: () => {
+                const p = tzParts(new Date());
+                setCustomDateKey(dayKey(new Date()));
+                setCustomHour(p.hour);
+                setCustomMinute(Math.floor(p.minute / 5) * 5);
+                setUseCustomTime(true);
+              },
+              className: "flex-1 py-2 rounded-xl text-sm border transition-colors " +
+                (useCustomTime ? "bg-[var(--pill-bg)] text-[var(--pill-text)] border-[var(--pill-bg)]" : "bg-[var(--surface-2)] border-[var(--surface-2-border)] text-[var(--text-secondary)] hover:border-[var(--surface-2-border-hover)]"),
+            },
+            "Add past feeding"
+          )
+        ),
+        useCustomTime && h(
+          "div",
+          { className: "mb-3" },
+          h(
+            "div",
+            { className: "flex gap-2 mb-2" },
+            [0, -1].map((delta) => {
+              const key = shiftDayKey(dayKey(new Date()), delta);
+              const label = delta === 0 ? "Today" : "Yesterday";
+              const isSel = customDateKey === key;
+              return h(
+                "button",
+                {
+                  key: label,
+                  onClick: () => setCustomDateKey(key),
+                  className: "flex-1 py-1.5 rounded-lg text-xs border transition-colors " +
+                    (isSel ? "bg-[var(--pill-bg)] text-[var(--pill-text)] border-[var(--pill-bg)]" : "bg-[var(--surface-2)] border-[var(--surface-2-border)] text-[var(--text-secondary)]"),
+                },
+                label
+              );
+            }),
+            h("input", {
+              type: "date",
+              value: customDateKey,
+              max: dayKey(new Date()),
+              onChange: (e) => setCustomDateKey(e.target.value),
+              className: "flex-1 bg-[var(--surface-2)] border border-[var(--surface-2-border)] rounded-lg px-2 text-xs text-[var(--text-primary)] outline-none focus:border-[#8FA8E0] font-mono",
+            })
+          ),
+          h(
+            "div",
+            { className: "flex items-center justify-center gap-1 bg-[var(--surface-2)] border border-[var(--surface-2-border)] rounded-lg py-1" },
+            h(TimeWheelColumn, {
+              values: Array.from({ length: 24 }, (_, hh) => hh),
+              value: customHour,
+              onChange: setCustomHour,
+              format: (v) => String(v).padStart(2, "0"),
+            }),
+            h("span", { className: "font-mono text-lg text-[var(--text-muted)]" }, ":"),
+            h(TimeWheelColumn, {
+              values: Array.from({ length: 12 }, (_, i) => i * 5),
+              value: customMinute,
+              onChange: setCustomMinute,
+              format: (v) => String(v).padStart(2, "0"),
+            }),
+            h("span", { className: "text-[10px] text-[var(--text-muted)] font-mono ml-1" }, "24h")
+          )
+        ),
+
+        error && h("p", { className: "text-xs text-[#E08A8A] mb-3" }, error),
+
+        h(
+          "button",
+          {
+            onClick: handleAddEntry,
+            disabled: submitting,
+            className: "w-full bg-[#F2C879] text-[#14162B] rounded-xl py-3.5 font-semibold text-base shadow-lg border border-[#F2C879] active:scale-[0.98] transition-transform disabled:opacity-50",
+          },
+          submitting ? "Logging…" : useCustomTime ? "Add past feeding" : "Log feed"
+        )
+      ),
+
+      /* Trend chart */
+      h(
+        "div",
+        { className: "mb-6" },
+        h("h2", { className: "text-sm font-mono uppercase tracking-wide text-[var(--text-muted)] mb-3" }, "Last 7 days"),
+        h(
+          "div",
+          { className: "bg-[var(--card-bg)] border border-[var(--card-border)] rounded-2xl p-3" },
+          h(StackedBarChart, { data: trendData, height: 170, selectedIndex: selectedTrendDay, onSelect: setSelectedTrendDay }),
+          h(
+            "div",
+            { className: "flex gap-4 justify-center mt-2 text-xs text-[var(--text-tertiary)]" },
+            h("span", { className: "flex items-center gap-1.5" }, h("span", { className: "w-2.5 h-2.5 rounded-full inline-block", style: { background: BREAST_COLOR } }), "Breast milk"),
+            h("span", { className: "flex items-center gap-1.5" }, h("span", { className: "w-2.5 h-2.5 rounded-full inline-block", style: { background: FORMULA_COLOR } }), "Formula")
+          ),
+          selectedTrendDay != null &&
+            trendData[selectedTrendDay] &&
+            h(
+              "div",
+              { className: "mt-3 bg-[var(--bg)] border border-[var(--card-border)] rounded-xl px-3 py-2.5 flex items-center justify-between" },
+              h("span", { className: "text-sm text-[var(--text-secondary)] font-medium" }, trendData[selectedTrendDay].fullLabel),
+              h(
+                "div",
+                { className: "flex gap-3 text-xs font-mono" },
+                h("span", { style: { color: "var(--gold-text)" } }, `${trendData[selectedTrendDay].breast} ml`),
+                h("span", { style: { color: FORMULA_COLOR } }, `${trendData[selectedTrendDay].formula} ml`),
+                h("span", { className: "text-[var(--text-muted)]" }, `= ${trendData[selectedTrendDay].breast + trendData[selectedTrendDay].formula} ml`)
+              )
+            )
+        )
+      ),
+
+      /* Feeding patterns */
+      h(
+        "div",
+        { className: "mb-6" },
+        h("h2", { className: "text-sm font-mono uppercase tracking-wide text-[var(--text-muted)] mb-3" }, "Feeding patterns"),
+
+        h(
+          "div",
+          { className: "grid grid-cols-2 gap-2 mb-3" },
+          h(
+            "div",
+            { className: "bg-[var(--card-bg)] border border-[var(--card-border)] rounded-2xl px-3 py-3 text-center" },
+            h("p", { className: "text-xs text-[var(--text-muted)] font-mono uppercase tracking-wide mb-1" }, "Avg interval"),
+            h("p", { className: "text-xl font-mono", style: { color: PATTERN_COLOR } }, avgIntervalMins7 != null ? fmtDuration(avgIntervalMins7) : "—"),
+            h("p", { className: "text-[10px] text-[var(--text-muted)] mt-0.5" }, "last 7 days")
+          ),
+          h(
+            "div",
+            { className: "bg-[var(--card-bg)] border border-[var(--card-border)] rounded-2xl px-3 py-3 text-center" },
+            h("p", { className: "text-xs text-[var(--text-muted)] font-mono uppercase tracking-wide mb-1" }, "Avg per feed"),
+            h("p", { className: "text-xl font-mono", style: { color: PATTERN_COLOR } }, avgVolume7 != null ? `${avgVolume7} ml` : "—"),
+            h("p", { className: "text-[10px] text-[var(--text-muted)] mt-0.5" }, "last 7 days")
+          )
+        ),
+
+        h(
+          "div",
+          { className: "bg-[var(--card-bg)] border border-[var(--card-border)] rounded-2xl p-4 mb-3" },
+          h("p", { className: "text-xs text-[var(--text-muted)] font-mono uppercase tracking-wide mb-3" }, "Day vs. night · last 7 days"),
+          splitTotalMl > 0
+            ? h(
+                React.Fragment,
+                null,
+                h(
+                  "div",
+                  { className: "flex h-2.5 rounded-full overflow-hidden mb-3" },
+                  h("div", { style: { width: `${dayPct}%`, background: "#F6C453" } }),
+                  h("div", { style: { width: `${nightPct}%`, background: "#5B6099" } })
+                ),
+                h(
+                  "div",
+                  { className: "flex justify-between text-sm" },
+                  h("span", { className: "flex items-center gap-1.5" }, "☀️ ", dayMl, " ml ", h("span", { className: "text-[var(--text-muted)] font-mono text-xs" }, `(${dayPct}%)`)),
+                  h("span", { className: "flex items-center gap-1.5" }, "🌙 ", nightMl, " ml ", h("span", { className: "text-[var(--text-muted)] font-mono text-xs" }, `(${nightPct}%)`))
+                ),
+                h("p", { className: "text-[10px] text-[var(--text-muted)] mt-2" }, "Day = 06:00–18:00, Night = 18:00–06:00")
+              )
+            : h("p", { className: "text-sm text-[var(--text-muted)]" }, "Not enough data yet.")
+        ),
+
+        h(
+          "div",
+          null,
+          h("p", { className: "text-xs text-[var(--text-muted)] font-mono uppercase tracking-wide mb-2 px-1" }, "When feeds happen · last 14 days"),
+          h(
+            "div",
+            { className: "bg-[var(--card-bg)] border border-[var(--card-border)] rounded-2xl p-3" },
+            h(FrequencyLineChart, { data: avgVolumeByTimeData, height: 100, currentIndex: currentBucketIndex })
+          )
+        ),
+
+        h(
+          "div",
+          { className: "mt-3" },
+          h("p", { className: "text-xs text-[var(--text-muted)] font-mono uppercase tracking-wide mb-2 px-1" }, "Avg volume by time · last 14 days"),
+          h(
+            "div",
+            { className: "bg-[var(--card-bg)] border border-[var(--card-border)] rounded-2xl p-3" },
+            h(AvgVolumeChart, { data: avgVolumeByTimeData, height: 110, currentIndex: currentBucketIndex })
+          )
+        )
+      ),
+
+      /* History */
+      h(
+        "div",
+        null,
+        h("h2", { className: "text-sm font-mono uppercase tracking-wide text-[var(--text-muted)] mb-3" }, "Feed history"),
+        historyKeys.length === 0 &&
+          h("p", { className: "text-sm text-[var(--text-muted)] bg-[var(--card-bg)] border border-[var(--card-border)] rounded-2xl p-4" },
+            "No feeds logged yet. Log the next one above — it'll show up here for both of you."),
+        historyKeys.slice(0, visibleDayCount).map((key, idx) => {
+          const dayEntries = historyByDay[key].slice().reverse();
+          const dayTotal = historyByDay[key].reduce((s, e) => s + e.volumeMl, 0);
+          const isExpanded = Object.prototype.hasOwnProperty.call(expandedDays, key) ? expandedDays[key] : idx === 0;
+          return h(
+            "div",
+            { key, className: "mb-2" },
+            h(
+              "button",
+              {
+                onClick: () => setExpandedDays((prev) => ({ ...prev, [key]: !isExpanded })),
+                className: "w-full flex items-center justify-between mb-1.5 px-1 py-1",
+              },
+              h(
+                "span",
+                { className: "flex items-center gap-1.5" },
+                h("span", { className: "text-[var(--text-muted)] text-xs transition-transform inline-block", style: { transform: isExpanded ? "rotate(90deg)" : "rotate(0deg)" } }, "▶"),
+                h("span", { className: "text-sm font-medium" }, fmtDayLabel(key)),
+                h("span", { className: "text-xs text-[var(--text-muted)] font-mono" }, `(${dayEntries.length})`)
+              ),
+              h("span", { className: "text-xs text-[var(--text-muted)] font-mono" }, `${dayTotal} ml`)
+            ),
+            isExpanded &&
+              h(
+                "div",
+                { className: "bg-[var(--card-bg)] border border-[var(--card-border)] rounded-2xl divide-y divide-[var(--card-border)]" },
+                dayEntries.map((e) =>
+                  h(
+                    "div",
+                    { key: e.id, className: "flex items-center gap-3 px-4 py-2.5" },
+                    h("span", { className: "w-2 h-2 rounded-full flex-shrink-0", style: { background: e.type === "breast" ? BREAST_COLOR : FORMULA_COLOR } }),
+                    h(
+                      "div",
+                      { className: "flex-1 min-w-0" },
+                      h("p", { className: "text-sm font-mono" }, fmtTime(e.time)),
+                      h(
+                        "p",
+                        { className: "text-xs text-[var(--text-muted)]" },
+                        `${e.volumeMl} ml`,
+                        e.gapMins != null && h("span", null, ` · +${fmtDuration(e.gapMins)}`)
+                      )
+                    ),
+                    confirmingDeleteId === e.id
+                      ? h(
+                          "div",
+                          { className: "flex items-center gap-1.5 flex-shrink-0" },
+                          h(
+                            "button",
+                            {
+                            onClick: () => handleDelete(e.id),
+                            className: "bg-[#E08A8A] text-[#14162B] text-xs font-semibold rounded-full px-2.5 py-1.5 transition-colors",
+                            "aria-label": "Confirm delete",
+                          },
+                          "Delete?"
+                        ),
+                        h(
+                          "button",
+                          {
+                            onClick: () => setConfirmingDeleteId(null),
+                            className: "bg-[var(--card-border)] text-[var(--text-tertiary)] rounded-full p-1.5 transition-colors",
+                            "aria-label": "Cancel delete",
+                          },
+                          "✕"
+                        )
+                      )
+                    : h(
+                        "button",
+                        {
+                          onClick: () => setConfirmingDeleteId(e.id),
+                          className: "bg-[var(--card-border)] hover:bg-[#3A1F2E] text-[var(--text-tertiary)] hover:text-[#E08A8A] rounded-full p-2 transition-colors flex-shrink-0",
+                          "aria-label": "Delete entry",
+                        },
+                        "✕"
+                      )
+                )
+              )
+            )
+          );
+        }),
+        historyKeys.length > visibleDayCount &&
+          h(
+            "button",
+            {
+              onClick: () => setVisibleDayCount((v) => v + 7),
+              className: "w-full text-center text-xs font-mono text-[#8FA8E0] bg-[var(--card-bg)] border border-[var(--card-border)] rounded-xl py-2.5 mt-1",
+            },
+            `Show 7 more days (${historyKeys.length - visibleDayCount} more available)`
+          )
+      )
+      ),
+
+      activeTab === "sleep" && h(SleepTab, {
+        isAsleep, sleepStatusMins, sleepStatusColor, showWakeWarning, ongoingSleep, lastCompletedSleep,
+        todaySleepTotalMins, todayNapCount, todayLongestStretchMins,
+        sleepTrendData, selectedSleepTrendDay, setSelectedSleepTrendDay,
+        avgNapsPerDay7, avgNapDurationMins7, longestStretchMins7, avgWakeWindowMins7,
+        sleepDayMins, sleepNightMins, sleepDayPct,
+        sleepBucketData, currentBucketIndex,
+        sleepHistoryKeys, sleepHistoryByDay, visibleSleepDayCount, setVisibleSleepDayCount,
+        expandedSleepDays, setExpandedSleepDays,
+        confirmingDeleteSleepId, setConfirmingDeleteSleepId, handleDeleteSleep,
+        toggleSleep, sleepSubmitting,
+        loggingPastSleep, setLoggingPastSleep,
+        sleepStartDateKey, setSleepStartDateKey, sleepStartHour, setSleepStartHour, sleepStartMinute, setSleepStartMinute,
+        sleepEndDateKey, setSleepEndDateKey, sleepEndHour, setSleepEndHour, sleepEndMinute, setSleepEndMinute,
+        handleAddPastSleep, error,
+        sleepInsightText, sleepInsightLoading, sleepInsightError, sleepInsightGeneratedAt, refreshSleepInsight,
+        insightsEnabled, groqKeyDraft, setGroqKeyDraft, saveGroqApiKey,
+      })
+    )
+  );
+}
+
+createRoot(document.getElementById("root")).render(h(App));
+</script>
+</body>
+</html>
